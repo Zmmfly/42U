@@ -13,7 +13,7 @@
 #include <vector>
 
 namespace u42::detail {
-namespace a = abi::v1;
+namespace a = abi::v2;
 struct engine;
 struct record;
 enum class phase { created, initializing, initialized, starting, active, revoking, stopped, faulted };
@@ -22,7 +22,7 @@ struct owned_method {
     std::string name, description, input_schema, output_schema;
 };
 struct capability_set {
-    std::vector<a::iid> interfaces;
+    a::contract protocol{};
     std::vector<owned_method> methods;
 };
 
@@ -40,10 +40,10 @@ struct context final : a::ictx, a::ievents, a::icaps, a::icalls, a::idiag {
     a::status U42_CALL announce(const a::caps_desc*) noexcept override;
     a::status U42_CALL watch(a::icap_sink*, a::token*) noexcept override;
     a::status U42_CALL unwatch(a::token) noexcept override;
-    a::status U42_CALL acquire(const char*, const a::iid*, a::irevoker*, a::borrow*) noexcept override;
+    a::status U42_CALL acquire(const char*, const a::contract*, a::irevoker*, a::borrow*) noexcept override;
     a::status U42_CALL release(a::token) noexcept override;
-    a::status U42_CALL bind_name(const char*, const char*, a::binding*) noexcept override;
-    a::status U42_CALL bind_id(const char*, a::method_id, a::binding*) noexcept override;
+    a::status U42_CALL bind_name(a::token, const char*, a::binding*) noexcept override;
+    a::status U42_CALL bind_id(a::token, a::method_id, a::binding*) noexcept override;
     a::status U42_CALL call(a::binding, a::bytes, a::iwriter*) noexcept override;
     a::status U42_CALL unbind(a::binding) noexcept override;
     void U42_CALL log(const char*) noexcept override;
@@ -70,15 +70,16 @@ struct lease_record {
     record* consumer;
     record* provider;
     std::uint64_t generation;
-    a::iid type;
-    void* ptr;
+    a::contract protocol;
     a::irevoker* receiver;
+    std::size_t active_calls = 0;
 };
 struct bound_method {
     record* consumer;
     std::string provider;
     std::uint64_t generation;
     a::method_id method;
+    a::token credential{};
 };
 struct queued_event { std::string name; std::string payload; };
 struct cap_notice {

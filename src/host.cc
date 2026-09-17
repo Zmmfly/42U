@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <set>
 #include <utility>
 
@@ -722,6 +723,119 @@ std::vector<std::string> teardown_order(const engine& e)
     return ids;
 }
 
+/**
+ * @brief Receiver registered for the temporary lease of one convenient administration call.
+ *
+ * The framework records this address inside the lease, so the receiver has to stay alive until
+ * the credential is provably returned. It therefore keeps only the issuing administration
+ * context and returns whatever credential the framework hands back, which makes it stateless and
+ * still usable after the operation that created it has returned.
+ */
+struct one_shot_receiver final : a::irevoker {
+    /** @brief Borrowed administration context that issued the credential; never null in use. */
+    context* admin = nullptr;
+
+    /**
+     * @brief Return the credential named by the framework on the control thread.
+     *
+     * @param credential Lease issued through this receiver; zero is ignored.
+     */
+    void U42_CALL on_revoke(a::token credential) noexcept override
+    {
+        if (admin != nullptr && credential.value != 0) (void)admin->release(credential);
+    }
+};
+
+/**
+ * @brief Lifetime owner for the temporary receiver of one convenient administration call.
+ *
+ * @note The receiver may only be destroyed once no credential referring to it exists. The flag
+ *       starts raised because the receiver is about to be handed to acquire(), and it is lowered
+ *       only when acquire() reported no credential or release() reported the credential gone
+ *       (ok/stale). Any other exit, including an escaping exception, deliberately retains the
+ *       receiver so a still-live credential never points at freed memory; this mirrors the
+ *       host's policy of retaining resources whose silence was not proven.
+ */
+struct one_shot_receiver_owner {
+    std::unique_ptr<one_shot_receiver> receiver;
+    bool holds_credential = true;
+
+    one_shot_receiver_owner() : receiver(std::make_unique<one_shot_receiver>()) {}
+    ~one_shot_receiver_owner()
+    {
+        if (holds_credential && receiver) (void)receiver.release(); // Deliberate retention.
+    }
+    one_shot_receiver_owner(const one_shot_receiver_owner&) = delete;
+    one_shot_receiver_owner& operator=(const one_shot_receiver_owner&) = delete;
+};
+
+/**
+ * @brief Run one explicit-protocol administration call with a temporary, always-returned lease.
+ *
+ * The synchronous frame performs acquire, bind, call, unbind and release in that order. The
+ * caller's contract is passed through unchanged: a protocol the host could discover never
+ * substitutes for the expectation the caller stated, and no provider pointer is used anywhere.
+ * *out is cleared by the nested invocation and never keeps partial output after a failure.
+ *
+ * @tparam Binder Callable performing the exact bind (name or numeric) for this call.
+ * @param owner Host facade performing the nested lease, binding and invocation operations.
+ * @param e Engine owning the administration context and its diagnostics.
+ * @param plug_id Current provider identity.
+ * @param required Explicitly accepted protocol for this call only.
+ * @param binder Bind operation for the requested method.
+ * @param args Borrowed input bytes for the invocation.
+ * @param out Required output string, cleared before any failure is reported.
+ * @return ok with complete output; otherwise the first invocation, bind, unbind or cleanup error.
+ */
+template <typename Binder>
+a::status one_shot_call(u42::host& owner, engine& e, const std::string& plug_id,
+                        const a::contract& required, Binder binder, a::bytes args, std::string* out)
+{
+    one_shot_receiver_owner receiver;
+    receiver.receiver->admin = e.admin.get();
+
+    a::borrow lease{};
+    a::status outcome = owner.acquire(plug_id, required, receiver.receiver.get(), &lease);
+    if (outcome != a::ok) {
+        // acquire() clears its output on failure, so no credential was issued and the receiver can
+        // be destroyed together with this frame.
+        receiver.holds_credential = false;
+        out->clear();
+        return outcome;
+    }
+
+    a::binding target{};
+    const a::status bound = binder(lease.credential, &target);
+    a::status invoked = a::ok;
+    a::status unbound = a::ok;
+    if (bound == a::ok) {
+        invoked = owner.call(target, args, out); // Clears *out when the invocation fails.
+        unbound = owner.unbind(target);          // Never skipped: an unused binding would leak.
+    } else {
+        out->clear();
+    }
+
+    // The credential is returned on every path, including a failed bind or invocation.
+    const a::status returned = owner.release(lease.credential);
+    const bool returned_cleanly = returned == a::ok || returned == a::stale;
+    if (returned_cleanly) receiver.holds_credential = false;
+
+    if (invoked != a::ok) return invoked;
+    if (bound != a::ok) return bound;
+    if (unbound != a::ok) {
+        out->clear();
+        return unbound;
+    }
+    if (!returned_cleanly) {
+        // The lease stays alive; the receiver was retained above so revoking it stays callable.
+        out->clear();
+        return e.fail(a::failed, "the temporary lease of plugin '" + plug_id +
+                                     "' could not be returned (" + status_text(returned) + ")");
+    }
+    e.error.clear();
+    return a::ok;
+}
+
 } // namespace
 
 a::status engine::stage(a::iplug_fty* factory, std::unique_ptr<plug> library)
@@ -1184,13 +1298,13 @@ host::host(host_options options) : engine_(std::make_unique<detail::engine>(opti
 host::~host()
 {
     if (!engine_) return;
-    abi::v1::status outcome = abi::v1::failed;
+    abi::v2::status outcome = abi::v2::failed;
     try {
         outcome = engine_->shutdown_all();
     } catch (...) {
-        outcome = abi::v1::failed;
+        outcome = abi::v2::failed;
     }
-    if (outcome != abi::v1::ok) {
+    if (outcome != abi::v2::ok) {
         // Deliberate retention: destroying a quarantined graph here would free plugin objects
         // whose stop()/borrowings were never proven silent. The engine, its contexts, instances
         // and library mappings stay alive until process exit instead of being partially torn down.
@@ -1198,22 +1312,22 @@ host::~host()
     }
 }
 
-abi::v1::status host::add(abi::v1::iplug_fty* factory)
+abi::v2::status host::add(abi::v2::iplug_fty* factory)
 {
-    if (!engine_) return abi::v1::failed;
+    if (!engine_) return abi::v2::failed;
     try {
         return engine_->stage(factory);
     } catch (...) {
         // Native API boundary: an allocation failure must not escape as a C++ exception, and the
         // handler must not allocate a diagnostic either, so it reports the status alone.
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::boot(const std::filesystem::path& directory)
+abi::v2::status host::boot(const std::filesystem::path& directory)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
 
     std::set<std::string> known; // Default construction cannot allocate; filled inside the guard.
     bool known_complete = false;
@@ -1221,7 +1335,7 @@ abi::v1::status host::boot(const std::filesystem::path& directory)
         // Reentrancy is rejected before any scan, open or stage: a callback must not reshape the
         // graph, and the refusal leaves no staged record behind.
         if (engine_->depth != 0) {
-            return detail::refuse(*engine_, abi::v1::busy,
+            return detail::refuse(*engine_, abi::v2::busy,
                                   "boot cannot run while a plugin call is on the stack");
         }
         for (const auto& entry : engine_->records) known.insert(entry.first);
@@ -1229,108 +1343,108 @@ abi::v1::status host::boot(const std::filesystem::path& directory)
 
         std::vector<std::filesystem::path> candidates;
         std::string diagnostic;
-        abi::v1::status outcome = scan_plugins(directory, candidates, diagnostic);
-        if (outcome != abi::v1::ok) return engine_->fail(outcome, diagnostic);
+        abi::v2::status outcome = scan_plugins(directory, candidates, diagnostic);
+        if (outcome != abi::v2::ok) return engine_->fail(outcome, diagnostic);
         if (candidates.empty()) {
             engine_->error.clear();
-            return abi::v1::ok;
+            return abi::v2::ok;
         }
 
         for (const std::filesystem::path& candidate : candidates) {
             auto library = std::make_unique<plug>();
             outcome = library->open(candidate, diagnostic);
-            if (outcome != abi::v1::ok) {
+            if (outcome != abi::v2::ok) {
                 detail::rollback_boot_batch(*engine_, known);
                 return engine_->fail(outcome, diagnostic);
             }
             // Read the borrowed factory before the mapping is handed over to the record: function
             // argument evaluation order is unspecified, so library->factory() must not share a
             // call with std::move(library).
-            abi::v1::iplug_fty* factory = library->factory();
+            abi::v2::iplug_fty* factory = library->factory();
             outcome = engine_->stage(factory, std::move(library));
-            if (outcome != abi::v1::ok) {
+            if (outcome != abi::v2::ok) {
                 // stage() already released the record it refused; report its precise diagnostic.
                 detail::rollback_boot_batch(*engine_, known);
                 return outcome;
             }
         }
-        const abi::v1::status started = engine_->start_pending();
-        if (started != abi::v1::ok) detail::rollback_boot_batch(*engine_, known);
+        const abi::v2::status started = engine_->start_pending();
+        if (started != abi::v2::ok) detail::rollback_boot_batch(*engine_, known);
         return started;
     } catch (...) {
         // A partial snapshot must never classify a pre-existing record as newly staged.
         if (known_complete) detail::rollback_boot_batch(*engine_, known);
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::start()
+abi::v2::status host::start()
 {
-    if (!engine_) return abi::v1::failed;
+    if (!engine_) return abi::v2::failed;
     try {
         return engine_->start_pending();
     } catch (...) {
-        return abi::v1::failed; // No diagnostic allocation on a native boundary failure path.
+        return abi::v2::failed; // No diagnostic allocation on a native boundary failure path.
     }
 }
 
-abi::v1::status host::load(const std::filesystem::path& path)
+abi::v2::status host::load(const std::filesystem::path& path)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
     try {
         // Reentrancy is refused before the library is opened or staged.
         if (engine_->depth != 0) {
-            return detail::refuse(*engine_, abi::v1::busy,
+            return detail::refuse(*engine_, abi::v2::busy,
                                   "load cannot run while a plugin call is on the stack");
         }
 
         auto library = std::make_unique<plug>();
         std::string diagnostic;
-        abi::v1::status outcome = library->open(path, diagnostic);
-        if (outcome != abi::v1::ok) return engine_->fail(outcome, diagnostic);
+        abi::v2::status outcome = library->open(path, diagnostic);
+        if (outcome != abi::v2::ok) return engine_->fail(outcome, diagnostic);
 
         // stage() rejects a second mapping of the same canonical library and a duplicate plug_id,
         // and it releases the record it refuses, which also unmaps this library. The borrowed
         // factory is read before the mapping is handed over (argument order is unspecified).
-        abi::v1::iplug_fty* factory = library->factory();
+        abi::v2::iplug_fty* factory = library->factory();
         outcome = engine_->stage(factory, std::move(library));
-        if (outcome != abi::v1::ok) return outcome;
+        if (outcome != abi::v2::ok) return outcome;
         return engine_->start_pending();
     } catch (...) {
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::unload(const std::string& plug_id)
+abi::v2::status host::unload(const std::string& plug_id)
 {
-    if (!engine_) return abi::v1::failed;
+    if (!engine_) return abi::v2::failed;
     try {
         return engine_->unload_one(plug_id);
     } catch (...) {
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::shutdown()
+abi::v2::status host::shutdown()
 {
-    if (!engine_) return abi::v1::failed;
+    if (!engine_) return abi::v2::failed;
     try {
         return engine_->shutdown_all();
     } catch (...) {
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::poll()
+abi::v2::status host::poll()
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
     try {
         // Queued requests for identities that no longer exist are dropped first: the dispatcher
         // restores a failing request, so a stale one would report not_found on every drain.
         detail::prune_deferred(*engine_);
-        const abi::v1::status dispatched = engine_->drain();
+        const abi::v2::status dispatched = engine_->drain();
         if (!detail::soft_dispatch_status(dispatched)) {
             // Keep a richer diagnostic from the dispatcher when it recorded one.
             if (!engine_->error.empty()) return dispatched;
@@ -1341,163 +1455,245 @@ abi::v1::status host::poll()
         // drain() owns deferred processing and restores a failed request for a later retry.
         // Do not pop it a second time here: a busy provider must stay queued, and an exhausted
         // event budget must leave all remaining work for the next bounded poll.
-        if (dispatched == abi::v1::ok) engine_->error.clear();
+        if (dispatched == abi::v2::ok) engine_->error.clear();
         return dispatched;
     } catch (const std::exception&) {
-        return abi::v1::failed; // Allocation-free: the failure must not be reported by allocating.
+        return abi::v2::failed; // Allocation-free: the failure must not be reported by allocating.
     } catch (...) {
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::bind(const std::string& plug_id, const std::string& method, abi::v1::binding* out)
+abi::v2::status host::protocol(const std::string& plug_id, abi::v2::contract* out)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
-    if (out == nullptr) return detail::refuse(*engine_, abi::v1::invalid_argument, "bind requires a non-null output binding");
-    *out = abi::v1::binding{};
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread; // Native rule: *out stays untouched.
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "protocol requires a non-null output contract");
+    *out = abi::v2::contract{};
     try {
-        const abi::v1::status outcome = engine_->admin->bind_name(plug_id.c_str(), method.c_str(), out);
-        if (outcome != abi::v1::ok) {
-            *out = abi::v1::binding{}; // Already cleared by the context; kept explicit for the ABI rule.
+        // Discovery reads the recorded announcement only: it calls no plugin, takes no lock and
+        // never becomes the caller's accepted requirement.
+        auto found = engine_->records.find(plug_id);
+        if (found == engine_->records.end())
+            return engine_->fail(abi::v2::not_found, "unknown plugin '" + plug_id + "'");
+        detail::record& rec = *found->second;
+        if (!rec.published)
+            return engine_->fail(abi::v2::not_found, "plugin '" + plug_id + "' has not published capabilities");
+        if (rec.state != detail::phase::active || rec.instance == nullptr)
+            return engine_->fail(abi::v2::invalid_state, "plugin '" + plug_id + "' is not an active provider");
+        if (!abi::v2::valid_contract(rec.capabilities.protocol))
+            return engine_->fail(abi::v2::invalid_state,
+                                 "plugin '" + plug_id + "' publishes no valid business protocol");
+        *out = rec.capabilities.protocol;
+        engine_->error.clear();
+        return abi::v2::ok;
+    } catch (const std::exception&) {
+        *out = abi::v2::contract{};
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
+    } catch (...) {
+        *out = abi::v2::contract{};
+        return abi::v2::failed;
+    }
+}
+
+abi::v2::status host::acquire(const std::string& plug_id, const abi::v2::contract& required,
+                              abi::v2::irevoker* receiver, abi::v2::borrow* out)
+{
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "acquire requires a non-null output borrow");
+    *out = abi::v2::borrow{};
+    if (receiver == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "acquire requires a non-null revocation receiver");
+    try {
+        // The administration context owns lease validation: provider identity and published
+        // state, a non-null stable receiver, the explicit required contract and the ABI rule that
+        // no provider address is ever returned.
+        const abi::v2::status outcome = engine_->admin->acquire(plug_id.c_str(), &required, receiver, out);
+        if (outcome != abi::v2::ok) {
+            *out = abi::v2::borrow{}; // The ABI requires a cleared output on every failure.
             return outcome;
         }
         engine_->error.clear();
-        return abi::v1::ok;
+        return abi::v2::ok;
     } catch (const std::exception&) {
-        *out = abi::v1::binding{};
-        return abi::v1::failed; // Allocation free; host::error() keeps its previous text.
+        *out = abi::v2::borrow{};
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
     } catch (...) {
-        *out = abi::v1::binding{};
-        return abi::v1::failed;
+        *out = abi::v2::borrow{};
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::bind(const std::string& plug_id, abi::v1::method_id method, abi::v1::binding* out)
+abi::v2::status host::release(abi::v2::token credential)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
-    if (out == nullptr) return detail::refuse(*engine_, abi::v1::invalid_argument, "bind requires a non-null output binding");
-    *out = abi::v1::binding{};
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (credential.value == 0) return detail::refuse(*engine_, abi::v2::invalid_argument, "release requires a non-zero lease credential");
     try {
-        const abi::v1::status outcome = engine_->admin->bind_id(plug_id.c_str(), method, out);
-        if (outcome != abi::v1::ok) {
-            *out = abi::v1::binding{};
-            return outcome;
-        }
-        engine_->error.clear();
-        return abi::v1::ok;
-    } catch (const std::exception&) {
-        *out = abi::v1::binding{};
-        return abi::v1::failed; // Allocation free; host::error() keeps its previous text.
-    } catch (...) {
-        *out = abi::v1::binding{};
-        return abi::v1::failed;
-    }
-}
-
-abi::v1::status host::unbind(abi::v1::binding value)
-{
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
-    if (value.value == 0) return detail::refuse(*engine_, abi::v1::invalid_argument, "unbind requires a non-zero binding");
-    try {
-        const abi::v1::status outcome = engine_->admin->unbind(value);
-        if (outcome == abi::v1::ok) engine_->error.clear();
+        // Only a successful return is a return: busy, an ownership error or a failure retains the
+        // credential, and the caller has to keep the receiver and retry.
+        const abi::v2::status outcome = engine_->admin->release(credential);
+        if (outcome == abi::v2::ok) engine_->error.clear();
         return outcome;
     } catch (const std::exception&) {
-        return abi::v1::failed;
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
     } catch (...) {
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::call(abi::v1::binding target, abi::v1::bytes args, std::string* out)
+abi::v2::status host::bind(abi::v2::token credential, const std::string& method, abi::v2::binding* out)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
-    if (out == nullptr) return detail::refuse(*engine_, abi::v1::invalid_argument, "call requires a non-null output string");
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "bind requires a non-null output binding");
+    *out = abi::v2::binding{};
+    if (credential.value == 0) return detail::refuse(*engine_, abi::v2::invalid_argument, "bind requires a non-zero lease credential");
+    try {
+        // The binding is created through the lease only; no provider pointer and no plug_id
+        // shortcut exists, so a reload can never satisfy an old binding silently.
+        const abi::v2::status outcome = engine_->admin->bind_name(credential, method.c_str(), out);
+        if (outcome != abi::v2::ok) {
+            *out = abi::v2::binding{}; // Already cleared by the context; kept explicit for the ABI rule.
+            return outcome;
+        }
+        engine_->error.clear();
+        return abi::v2::ok;
+    } catch (const std::exception&) {
+        *out = abi::v2::binding{};
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
+    } catch (...) {
+        *out = abi::v2::binding{};
+        return abi::v2::failed;
+    }
+}
+
+abi::v2::status host::bind(abi::v2::token credential, abi::v2::method_id method, abi::v2::binding* out)
+{
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "bind requires a non-null output binding");
+    *out = abi::v2::binding{};
+    if (credential.value == 0) return detail::refuse(*engine_, abi::v2::invalid_argument, "bind requires a non-zero lease credential");
+    try {
+        const abi::v2::status outcome = engine_->admin->bind_id(credential, method, out);
+        if (outcome != abi::v2::ok) {
+            *out = abi::v2::binding{};
+            return outcome;
+        }
+        engine_->error.clear();
+        return abi::v2::ok;
+    } catch (const std::exception&) {
+        *out = abi::v2::binding{};
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
+    } catch (...) {
+        *out = abi::v2::binding{};
+        return abi::v2::failed;
+    }
+}
+
+abi::v2::status host::unbind(abi::v2::binding value)
+{
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (value.value == 0) return detail::refuse(*engine_, abi::v2::invalid_argument, "unbind requires a non-zero binding");
+    try {
+        const abi::v2::status outcome = engine_->admin->unbind(value);
+        if (outcome == abi::v2::ok) engine_->error.clear();
+        return outcome;
+    } catch (const std::exception&) {
+        return abi::v2::failed;
+    } catch (...) {
+        return abi::v2::failed;
+    }
+}
+
+abi::v2::status host::call(abi::v2::binding target, abi::v2::bytes args, std::string* out)
+{
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "call requires a non-null output string");
     out->clear();
-    if (target.value == 0) return detail::refuse(*engine_, abi::v1::invalid_argument, "call requires a non-zero binding");
+    if (target.value == 0) return detail::refuse(*engine_, abi::v2::invalid_argument, "call requires a non-zero binding");
     if (args.data == nullptr && args.size != 0) {
-        return detail::refuse(*engine_, abi::v1::invalid_argument, "call received a null argument view with a non-zero size");
+        return detail::refuse(*engine_, abi::v2::invalid_argument, "call received a null argument view with a non-zero size");
     }
     try {
         detail::string_writer writer(engine_->options.output_limit);
-        const abi::v1::status outcome = engine_->admin->call(target, args, &writer);
-        if (outcome != abi::v1::ok) {
+        const abi::v2::status outcome = engine_->admin->call(target, args, &writer);
+        if (outcome != abi::v2::ok) {
             out->clear(); // Partial output is discarded when the invocation fails.
             return outcome;
         }
-        if (writer.result != abi::v1::ok) {
+        if (writer.result != abi::v2::ok) {
             out->clear();
             return engine_->fail(writer.result, "result writer rejected the output of the invocation (" +
                                                     detail::status_text(writer.result) + ")");
         }
         *out = std::move(writer.value);
         engine_->error.clear();
-        return abi::v1::ok;
+        return abi::v2::ok;
     } catch (const std::exception&) {
         out->clear();
-        return abi::v1::failed;
+        return abi::v2::failed;
     } catch (...) {
         out->clear();
-        return abi::v1::failed;
+        return abi::v2::failed;
     }
 }
 
-abi::v1::status host::call(const std::string& plug_id, const std::string& method, abi::v1::bytes args,
-                           std::string* out)
+abi::v2::status host::call(const std::string& plug_id, const abi::v2::contract& required,
+                           const std::string& method, abi::v2::bytes args, std::string* out)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
-    if (out == nullptr) return detail::refuse(*engine_, abi::v1::invalid_argument, "call requires a non-null output string");
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "call requires a non-null output string");
     out->clear();
-
-    abi::v1::binding temporary{};
-    abi::v1::status outcome = bind(plug_id, method, &temporary);
-    if (outcome != abi::v1::ok) {
-        out->clear();
-        return outcome;
+    if (args.data == nullptr && args.size != 0) {
+        return detail::refuse(*engine_, abi::v2::invalid_argument, "call received a null argument view with a non-zero size");
     }
-    outcome = call(temporary, args, out);
-    const abi::v1::status released = unbind(temporary); // The convenience form never leaks a binding.
-    if (outcome != abi::v1::ok) {
+    try {
+        // The stated requirement is this frame's expectation for one administration call; it is
+        // never replaced by a protocol the host could discover, and it grants no lasting lease.
+        return detail::one_shot_call(*this, *engine_, plug_id, required,
+                                     [this, &method](abi::v2::token credential, abi::v2::binding* slot) {
+                                         return bind(credential, method, slot);
+                                     },
+                                     args, out);
+    } catch (const std::exception&) {
         out->clear();
-        return outcome;
-    }
-    if (released != abi::v1::ok) {
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
+    } catch (...) {
         out->clear();
-        return released;
+        return abi::v2::failed;
     }
-    return abi::v1::ok;
 }
 
-abi::v1::status host::call(const std::string& plug_id, abi::v1::method_id method, abi::v1::bytes args,
-                           std::string* out)
+abi::v2::status host::call(const std::string& plug_id, const abi::v2::contract& required,
+                           abi::v2::method_id method, abi::v2::bytes args, std::string* out)
 {
-    if (!engine_) return abi::v1::failed;
-    if (!engine_->on_thread()) return abi::v1::wrong_thread;
-    if (out == nullptr) return detail::refuse(*engine_, abi::v1::invalid_argument, "call requires a non-null output string");
+    if (!engine_) return abi::v2::failed;
+    if (!engine_->on_thread()) return abi::v2::wrong_thread;
+    if (out == nullptr) return detail::refuse(*engine_, abi::v2::invalid_argument, "call requires a non-null output string");
     out->clear();
-
-    abi::v1::binding temporary{};
-    abi::v1::status outcome = bind(plug_id, method, &temporary);
-    if (outcome != abi::v1::ok) {
-        out->clear();
-        return outcome;
+    if (args.data == nullptr && args.size != 0) {
+        return detail::refuse(*engine_, abi::v2::invalid_argument, "call received a null argument view with a non-zero size");
     }
-    outcome = call(temporary, args, out);
-    const abi::v1::status released = unbind(temporary);
-    if (outcome != abi::v1::ok) {
+    try {
+        // Numeric form of the explicit-protocol scratch call; numeric lookup shares the same
+        // generation-checked path as the named one.
+        return detail::one_shot_call(*this, *engine_, plug_id, required,
+                                     [this, &method](abi::v2::token credential, abi::v2::binding* slot) {
+                                         return bind(credential, method, slot);
+                                     },
+                                     args, out);
+    } catch (const std::exception&) {
         out->clear();
-        return outcome;
-    }
-    if (released != abi::v1::ok) {
+        return abi::v2::failed; // Allocation free; host::error() keeps its previous text.
+    } catch (...) {
         out->clear();
-        return released;
+        return abi::v2::failed;
     }
-    return abi::v1::ok;
 }
 
 std::vector<std::string> host::plugins() const

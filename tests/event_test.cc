@@ -5,7 +5,7 @@
  *
  * The file owns its main() and links only against the host sources, so it can be built as:
  *   g++ -std=c++17 -Wall -Wextra -Werror -Iinc src/events.cc src/context.cc src/order.cc
- *       src/plug.cc src/host.cc tests/event_test.cc -o /tmp/u42-event-test
+ *       src/plug.cc src/host.cc tests/event_test.cc -o build/invoke-v2/events/event_test
  *
  * Every fixture is an in-process plugin factory handed to u42::host::add(), so no shared object,
  * no framework and no private header is involved: the checks only use the public ABI in
@@ -40,8 +40,19 @@
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
 namespace sdk = u42::sdk;
+
+/**
+ * @brief Business protocol every fixture announces: a valid, method-less v2 family.
+ *
+ * The fixtures publish no methods, so start() announces this protocol with an empty method set.
+ * That is the legal v2 shape for an instance that has a lifetime but no callable capability, and
+ * it lets the capability-watch case prove the notice view carries protocol+methods instead of a
+ * v1 interface list.
+ */
+constexpr abi::iid fixture_protocol_id{0x6576666978667431ULL, 1};
+constexpr abi::contract fixture_protocol{fixture_protocol_id, 1u, 0u};
 
 const char* g_current_test = nullptr;
 using check_hook = void (*)(const char* expr, const char* file, int line);
@@ -141,6 +152,7 @@ struct hub {
     int cap_events = 0;      //!< Number of delivered on_capability() callbacks.
     int cap_available = 0;   //!< Capability notices that reported an available provider.
     int cap_withdrawn = 0;   //!< Capability notices that reported a withdrawal.
+    abi::contract last_available_protocol{}; //!< Protocol carried by the latest available notice.
     int cancel_calls = 0;    //!< Callback-driven unsubscriptions of other subscriptions.
     abi::status cancel_status = abi::ok; //!< Status of the last callback-driven unsubscription.
     bool in_lifecycle = false;           //!< True while init()/start()/stop() is on the stack.
@@ -239,7 +251,7 @@ public:
     }
 
     /**
-     * @brief Announce an empty capability set, as a plugin without published interfaces does.
+     * @brief Announce the fixture's method-less v2 protocol, as a discoverable plugin does.
      *
      * @return The announce status; a non-ok status is recorded in the hub before it is returned.
      */
@@ -249,7 +261,10 @@ public:
         ++shared_.starts;
         abi::status outcome = abi::invalid_state;
         try {
-            abi::caps_desc announcement{}; // No interfaces and no methods by design.
+            // A valid protocol with no methods: the legal v2 shape for a plugin whose only
+            // published capability is its own lifetime. It never answers query(invoke_iid).
+            abi::caps_desc announcement{};
+            announcement.protocol = fixture_protocol;
             if (caps_ != nullptr) outcome = caps_->announce(&announcement);
         } catch (...) {
             outcome = abi::failed;
@@ -283,7 +298,7 @@ public:
     }
 
     /**
-     * @brief Report that this fixture publishes no optional interface.
+     * @brief Report that this fixture exposes no host-private invoke interface.
      *
      * @param out Cleared output slot; a null value is tolerated.
      * @return Always unsupported, with the output cleared.
@@ -339,7 +354,7 @@ public:
     }
 
     /**
-     * @brief Record one capability notice without calling any business method.
+     * @brief Record one capability notice, including the protocol it carries.
      *
      * @param value Borrowed notice, valid only for this call.
      *
@@ -352,6 +367,7 @@ public:
             ++shared_.cap_events;
             if (value != nullptr && value->available != 0) {
                 ++shared_.cap_available;
+                shared_.last_available_protocol = value->capabilities.protocol;
             } else {
                 ++shared_.cap_withdrawn;
             }
@@ -389,7 +405,7 @@ public:
      * @brief Remove one of the fixture's own subscriptions by event name.
      *
      * @param name Subscribed event name to remove.
-     * @return abi::v1::ok when removed, abi::v1::not_found when this fixture has no such
+     * @return abi::v2::ok when removed, abi::v2::not_found when this fixture has no such
      *         subscription, otherwise the status from ievents::unsubscribe().
      */
     abi::status unsubscribe_named(const char* name) noexcept
@@ -918,6 +934,11 @@ TEST_CASE(capability_watch_queues_the_snapshot_instead_of_calling_inline)
     CHECK(shared.inline_callbacks == 0);
     CHECK(shared.cap_events >= 1);
     CHECK(shared.cap_available >= 1);
+    // The protocol+methods view replaced the v1 interface list: the available notice carried the
+    // exact v2 protocol the provider announced, and no interface pointer travelled with it.
+    CHECK(shared.last_available_protocol.id == fixture_protocol.id);
+    CHECK(shared.last_available_protocol.major == fixture_protocol.major);
+    CHECK(abi::valid_contract(shared.last_available_protocol));
     CHECK(shared.failures == 0);
 
     const int after_start = shared.cap_events;

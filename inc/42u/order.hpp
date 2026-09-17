@@ -22,7 +22,7 @@ struct order_node {
  * @param error Human-readable failure diagnostic; empty on success.
  * @return ABI status, including duplicate, not_found, invalid_state and cycle.
  */
-abi::v1::status plan_order(const std::vector<order_node>& nodes,
+abi::v2::status plan_order(const std::vector<order_node>& nodes,
                           const std::vector<std::string>& initialized,
                           std::vector<std::size_t>& out, std::string& error);
 } // namespace u42

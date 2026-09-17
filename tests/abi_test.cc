@@ -10,12 +10,18 @@
  *   clang++ -std=c++17 -Wall -Wextra -Werror -Iinc tests/abi_test.cc -o /tmp/u42-abi-test
  * @endcode
  *
- * What it verifies: the frozen v1 contract is restated here as compile-time assertions (integer
- * widths, status values, opaque identifier defaults, descriptor layout, interface shape, every
- * virtual signature with its calling convention and noexcept, the entry signature and symbol name)
- * and as mock-based runtime checks (entry negotiation, output clearing, multi-interface query
- * adjustment, lifecycle destruction). An accidental edit to abi.hpp therefore fails this build
- * instead of silently changing the binary interface.
+ * What it verifies: the frozen v2 contract is restated here as compile-time assertions (integer
+ * widths, status values, opaque identifier defaults, descriptor layout, the credential-only lease
+ * shape, the protocol contract helpers, every virtual signature with its calling convention and
+ * noexcept, the entry signature and symbol name) and as mock-based runtime checks (entry
+ * negotiation, output clearing, multi-interface query adjustment, lifecycle destruction). An
+ * accidental edit to abi.hpp therefore fails this build instead of silently changing the binary
+ * interface.
+ *
+ * Two v2 obligations are asserted structurally rather than functionally, because no size or
+ * alignment trait can observe them: a lease carries no peer address (@c borrow must not declare a
+ * @c ptr member, and must be exactly one credential wide) and a binding cannot be created without a
+ * lease credential (@c icalls bind takes a @c token first, never a plug id or interface pointer).
  *
  * What it deliberately does not claim:
  * - It does not prove binary compatibility between a separately compiled plugin and host. Two
@@ -51,7 +57,7 @@
 
 namespace {
 
-namespace a = u42::abi::v1;
+namespace a = u42::abi::v2;
 
 const char* g_current_test = nullptr;
 
@@ -193,6 +199,31 @@ T* stale_sentinel() noexcept
 {
     return reinterpret_cast<T*>(static_cast<std::uintptr_t>(1));
 }
+
+/**
+ * @brief Compile-time probes for ABI members that v2 deliberately removed.
+ *
+ * A field that no code reads still changes the layout, so "unused" is not the same as "absent".
+ * No size, alignment or type trait can report a member's name, so these probes are the only way to
+ * assert at compile time that the v1 peer address (@c borrow::ptr) and the v1 cross-plugin
+ * interface list (@c caps_desc::interfaces / @c interface_count) are gone rather than ignored.
+ *
+ * @tparam T Type whose member list is inspected.
+ */
+template <class T, class = void>
+struct has_member_ptr : std::false_type {};
+template <class T>
+struct has_member_ptr<T, std::void_t<decltype(&T::ptr)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_interfaces : std::false_type {};
+template <class T>
+struct has_member_interfaces<T, std::void_t<decltype(&T::interfaces)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_interface_count : std::false_type {};
+template <class T>
+struct has_member_interface_count<T, std::void_t<decltype(&T::interface_count)>> : std::true_type {};
 
 /**
  * @brief State shared by the mock factory and every mock instance it creates.
@@ -370,9 +401,9 @@ a::iplug_fty* mock_factory()
  *
  * @param major Requested ABI major.
  * @param out Caller-owned output slot; a required argument, so null is a parameter error.
- * @return invalid_argument for a null @p out or @p major zero, unsupported for a different major,
- *         ok when @p major matches abi::v1::abi_major. A rejected negotiation leaves the caller's
- *         output cleared rather than stale.
+ * @return invalid_argument for a null @p out or @p major zero, unsupported for a different major
+ *         (including the incompatible v1 profile), ok when @p major matches abi::v2::abi_major. A
+ *         rejected negotiation leaves the caller's output cleared rather than stale.
  */
 extern "C" a::status U42_CALL u42_abi_test_mock_entry(std::uint32_t major,
                                                      a::iplug_fty** out) noexcept
@@ -390,6 +421,23 @@ struct context_state {
     int query_calls = 0;
     int events_calls = 0;
     int caps_calls = 0;
+};
+
+/**
+ * @brief Mock revoker observing whether a lease negotiation ever reaches the caller's receiver.
+ *
+ * A granted lease is revoked by the host through this callback, so it has to be a stable address
+ * that outlives the lease. The mock counts calls instead of returning anything, which is the whole
+ * of the frozen @c irevoker contract.
+ */
+struct mock_revoker final : a::irevoker {
+    int calls = 0;
+
+    void U42_CALL on_revoke(a::token credential) noexcept override
+    {
+        (void)credential;
+        ++calls;
+    }
 };
 
 /**
@@ -457,9 +505,19 @@ struct mock_context final : a::ictx, a::ievents, a::icaps {
         return a::unsupported;
     }
 
-    a::status U42_CALL acquire(const char*, const a::iid*, a::irevoker*, a::borrow*) noexcept override
+    a::status U42_CALL acquire(const char* plug_id, const a::contract* required, a::irevoker* receiver,
+                               a::borrow* out) noexcept override
     {
+        if (out == nullptr) return a::invalid_argument;
+        // A legal lease output is cleared before anything else happens, so a rejected lease never
+        // leaves a stale credential (let alone an address) for the caller to use.
+        *out = a::borrow{};
         ++state.caps_calls;
+        if (plug_id == nullptr || required == nullptr || receiver == nullptr) {
+            return a::invalid_argument;
+        }
+        // A bare context owns no provider, so it can never grant a lease; what this stand-in does
+        // verify is that only a credential can appear in the lease slot, never a peer address.
         return a::unsupported;
     }
 
@@ -516,19 +574,30 @@ constexpr std::size_t method_output_schema = method_input_schema + sizeof(const 
 constexpr std::size_t method_desc_size =
     align_up(method_output_schema + sizeof(const char*), alignof(a::method_desc));
 
-constexpr std::size_t caps_interfaces = align_up(2 * sizeof(std::uint32_t), alignof(const a::iid*));
-constexpr std::size_t caps_method_count = caps_interfaces + sizeof(const a::iid*);
+// v2: a protocol contract is an identity plus two version numbers, and its natural-alignment
+// layout follows field by field, independent of the pointer width.
+constexpr std::size_t contract_major = align_up(sizeof(a::iid), alignof(std::uint32_t));
+constexpr std::size_t contract_minor = contract_major + sizeof(std::uint32_t);
+constexpr std::size_t contract_size =
+    align_up(contract_minor + sizeof(std::uint32_t), alignof(a::contract));
+
+// v2 caps_desc no longer publishes a cross-plugin interface list: struct_size, method_count,
+// methods, protocol. The contract therefore follows the methods pointer with no extra tag.
 constexpr std::size_t caps_methods =
-    align_up(caps_method_count + sizeof(std::uint32_t), alignof(const a::method_desc*));
+    align_up(2 * sizeof(std::uint32_t), alignof(const a::method_desc*));
+constexpr std::size_t caps_protocol =
+    align_up(caps_methods + sizeof(const a::method_desc*), alignof(a::contract));
 constexpr std::size_t caps_desc_size =
-    align_up(caps_methods + sizeof(const a::method_desc*), alignof(a::caps_desc));
+    align_up(caps_protocol + sizeof(a::contract), alignof(a::caps_desc));
 
 constexpr std::size_t bytes_size_field = align_up(sizeof(const void*), alignof(std::uint64_t));
 constexpr std::size_t bytes_size =
     align_up(bytes_size_field + sizeof(std::uint64_t), alignof(a::bytes));
 
-constexpr std::size_t borrow_credential = align_up(sizeof(void*), alignof(a::token));
-constexpr std::size_t borrow_size = align_up(borrow_credential + sizeof(a::token), alignof(a::borrow));
+// v2: the lease holds exactly one opaque credential, so its own model starts at offset zero.
+constexpr std::size_t borrow_credential = 0;
+constexpr std::size_t borrow_size =
+    align_up(borrow_credential + sizeof(a::token), alignof(a::borrow));
 
 constexpr std::size_t event_payload = align_up(sizeof(const char*), alignof(a::bytes));
 constexpr std::size_t event_size = align_up(event_payload + sizeof(a::bytes), alignof(a::event));
@@ -574,7 +643,12 @@ TEST_CASE(status_and_method_id_are_fixed_width)
     static_assert(std::is_same_v<a::method_id, std::uint32_t>);
     static_assert(sizeof(a::status) == 4 && sizeof(a::method_id) == 4);
     static_assert(std::is_unsigned_v<a::status> && std::is_unsigned_v<a::method_id>);
-    static_assert(a::abi_major == 1);
+
+    // The frozen major version. v2 is a distinct, non-source-compatible profile, so the value is
+    // pinned rather than merely compared, and a stale v1 expectation cannot slip through.
+    static_assert(std::is_same_v<decltype(a::abi_major), const std::uint32_t>);
+    static_assert(a::abi_major == 2u);
+    static_assert(a::abi_major != 1u, "v1 layouts are incompatible with this profile");
 
     // Every named status keeps the numeric value the frozen wire protocol publishes.
     static_assert(a::ok == 0);
@@ -592,7 +666,7 @@ TEST_CASE(status_and_method_id_are_fixed_width)
     static_assert(a::deferred == 12);
 
     static_assert(a::entry_name != nullptr);
-    CHECK(a::abi_major == 1);
+    CHECK(a::abi_major == 2u);
 
     constexpr a::status codes[] = {
         a::ok,          a::invalid_argument, a::unsupported, a::not_found, a::duplicate,
@@ -612,6 +686,7 @@ TEST_CASE(abi_structs_are_standard_layout_and_trivially_copyable)
     U42_FROZEN_POD(a::token);
     U42_FROZEN_POD(a::binding);
     U42_FROZEN_POD(a::bytes);
+    U42_FROZEN_POD(a::contract);
     U42_FROZEN_POD(a::borrow);
     U42_FROZEN_POD(a::plug_desc);
     U42_FROZEN_POD(a::method_desc);
@@ -632,14 +707,22 @@ TEST_CASE(abi_structs_are_standard_layout_and_trivially_copyable)
     static_assert(alignof(a::token) == alignof(std::uint64_t));
 }
 
-TEST_CASE(official_iids_encode_the_v1_tag)
+TEST_CASE(official_iids_encode_the_v2_tag)
 {
-    // The high half spells "42U_ABI1" byte by byte, so an accidentally invented iid is obvious.
-    static_assert(tag_spells(a::events_iid.high, "42U_ABI1"));
-    static_assert(tag_spells(a::caps_iid.high, "42U_ABI1"));
-    static_assert(tag_spells(a::calls_iid.high, "42U_ABI1"));
-    static_assert(tag_spells(a::diag_iid.high, "42U_ABI1"));
-    static_assert(tag_spells(a::invoke_iid.high, "42U_ABI1"));
+    // The high half spells "42U_ABI2" byte by byte and equals the frozen v2 literal, so an
+    // accidentally invented or v1-derived iid is obvious.
+    static_assert(tag_spells(a::events_iid.high, "42U_ABI2"));
+    static_assert(tag_spells(a::caps_iid.high, "42U_ABI2"));
+    static_assert(tag_spells(a::calls_iid.high, "42U_ABI2"));
+    static_assert(tag_spells(a::diag_iid.high, "42U_ABI2"));
+    static_assert(tag_spells(a::invoke_iid.high, "42U_ABI2"));
+    static_assert(a::events_iid.high == 0x3432555f41424932ULL);
+    static_assert(a::caps_iid.high == 0x3432555f41424932ULL);
+    static_assert(a::calls_iid.high == 0x3432555f41424932ULL);
+    static_assert(a::diag_iid.high == 0x3432555f41424932ULL);
+    static_assert(a::invoke_iid.high == 0x3432555f41424932ULL);
+    // The version tag lives in the identity itself: a v1 high half must not compare equal.
+    static_assert(a::events_iid.high != 0x3432555f41424931ULL);
 
     // The low half is the published per-contract number, and every official id is distinct.
     static_assert(a::events_iid.low == 1);
@@ -660,7 +743,7 @@ TEST_CASE(official_iids_encode_the_v1_tag)
 
     // A zero identifier is not a published contract; comparison stays constexpr and noexcept.
     static_assert(a::events_iid != a::iid{});
-    static_assert(a::events_iid == a::iid{0x3432555f41424931ULL, 1});
+    static_assert(a::events_iid == a::iid{0x3432555f41424932ULL, 1});
     static_assert(std::is_same_v<decltype(&a::operator==), bool (*)(a::iid, a::iid) noexcept>);
     static_assert(std::is_same_v<decltype(&a::operator!=), bool (*)(a::iid, a::iid) noexcept>);
     static_assert(noexcept(a::events_iid == a::caps_iid));
@@ -669,7 +752,7 @@ TEST_CASE(official_iids_encode_the_v1_tag)
     constexpr std::size_t count = sizeof(ids) / sizeof(ids[0]);
     CHECK(count == 5);
     for (std::size_t i = 0; i < count; ++i) {
-        CHECK(ids[i].high == 0x3432555f41424931ULL);
+        CHECK(ids[i].high == 0x3432555f41424932ULL);
         CHECK(ids[i].low == static_cast<std::uint64_t>(i + 1));
         for (std::size_t j = i + 1; j < count; ++j) CHECK(ids[i] != ids[j]);
     }
@@ -703,18 +786,22 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(offsetof(a::method_desc, output_schema) == natural::method_output_schema);
     static_assert(sizeof(a::method_desc) == natural::method_desc_size);
 
+    static_assert(offsetof(a::contract, id) == 0);
+    static_assert(offsetof(a::contract, major) == natural::contract_major);
+    static_assert(offsetof(a::contract, minor) == natural::contract_minor);
+    static_assert(sizeof(a::contract) == natural::contract_size);
+
     static_assert(offsetof(a::caps_desc, struct_size) == 0);
-    static_assert(offsetof(a::caps_desc, interface_count) == sizeof(std::uint32_t));
-    static_assert(offsetof(a::caps_desc, interfaces) == natural::caps_interfaces);
-    static_assert(offsetof(a::caps_desc, method_count) == natural::caps_method_count);
+    static_assert(offsetof(a::caps_desc, method_count) == sizeof(std::uint32_t));
     static_assert(offsetof(a::caps_desc, methods) == natural::caps_methods);
+    static_assert(offsetof(a::caps_desc, protocol) == natural::caps_protocol);
     static_assert(sizeof(a::caps_desc) == natural::caps_desc_size);
 
     static_assert(offsetof(a::bytes, data) == 0);
     static_assert(offsetof(a::bytes, size) == natural::bytes_size_field);
     static_assert(sizeof(a::bytes) == natural::bytes_size);
 
-    static_assert(offsetof(a::borrow, ptr) == 0);
+    // The lease's only field is the credential; there is no slot a peer address could occupy.
     static_assert(offsetof(a::borrow, credential) == natural::borrow_credential);
     static_assert(sizeof(a::borrow) == natural::borrow_size);
 
@@ -731,11 +818,23 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(a::plug_desc{}.struct_size == sizeof(a::plug_desc));
     static_assert(a::caps_desc{}.struct_size == sizeof(a::caps_desc));
     static_assert(std::is_same_v<decltype(a::plug_desc::struct_size), std::uint32_t>);
-    static_assert(std::is_same_v<decltype(a::caps_desc::interface_count), std::uint32_t>);
+    static_assert(std::is_same_v<decltype(a::caps_desc::method_count), std::uint32_t>);
+    static_assert(std::is_same_v<decltype(a::caps_desc::protocol), a::contract>);
     static_assert(a::plug_desc{}.reserved == 0);
     static_assert(a::plug_desc{}.before == nullptr && a::plug_desc{}.after == nullptr);
     static_assert(a::plug_desc{}.before_count == 0 && a::plug_desc{}.after_count == 0);
-    static_assert(a::caps_desc{}.interfaces == nullptr && a::caps_desc{}.methods == nullptr);
+    static_assert(a::caps_desc{}.methods == nullptr);
+    static_assert(a::caps_desc{}.protocol.id == a::iid{});
+    static_assert(a::caps_desc{}.protocol.major == 0 && a::caps_desc{}.protocol.minor == 0);
+    static_assert(a::contract{}.id == a::iid{});
+    static_assert(a::contract{}.major == 0 && a::contract{}.minor == 0);
+
+    // v2 deleted the v1 cross-plugin interface list entirely: the members must be *absent*, not
+    // merely unused, because an unused field still changes the wire layout.
+    static_assert(!has_member_interfaces<a::caps_desc>::value,
+                  "caps_desc must not publish a cross-plugin interface list");
+    static_assert(!has_member_interface_count<a::caps_desc>::value,
+                  "caps_desc must not publish an interface count");
 
     // Width-independent structural facts, true on every data model.
     static_assert(alignof(a::plug_desc) >= alignof(void*));
@@ -743,20 +842,34 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(sizeof(a::plug_desc) >= offsetof(a::plug_desc, after) + sizeof(const char* const*));
     static_assert(sizeof(a::caps_desc) >=
                   offsetof(a::caps_desc, methods) + sizeof(const a::method_desc*));
+    static_assert(sizeof(a::caps_desc) ==
+                  offsetof(a::caps_desc, protocol) + sizeof(a::contract));
+    static_assert(offsetof(a::borrow, credential) == 0);
+    static_assert(sizeof(a::borrow) == sizeof(a::token));
+    static_assert(sizeof(a::contract) > sizeof(a::iid));
     CHECK(a::plug_desc{}.struct_size == sizeof(a::plug_desc));
     CHECK(a::caps_desc{}.struct_size == sizeof(a::caps_desc));
 
 #if U42_ABI_TEST_POINTER64
     // Exact numbers for the 64-bit-pointer profiles this test is built for. They are the frozen
-    // wire layout: 2 x uint32 tag, then pointers, with a 4-byte hole before each pointer that
-    // follows a 32-bit field.
+    // wire layout: 2 x uint32 tag, then pointers, with a 4-byte hole before each pointer or
+    // 64-bit field that follows two 32-bit fields.
     static_assert(sizeof(void*) == 8);
     static_assert(sizeof(a::iid) == 16 && alignof(a::iid) == 8);
     static_assert(offsetof(a::iid, high) == 0 && offsetof(a::iid, low) == 8);
     static_assert(sizeof(a::token) == 8 && alignof(a::token) == 8);
     static_assert(sizeof(a::binding) == 8 && alignof(a::binding) == 8);
     static_assert(sizeof(a::bytes) == 16 && alignof(a::bytes) == 8);
-    static_assert(sizeof(a::borrow) == 16 && alignof(a::borrow) == 8);
+    // v2 lease: 8 bytes, and a peer address is structurally impossible in it.
+    static_assert(sizeof(a::borrow) == 8 && alignof(a::borrow) == 8);
+    static_assert(offsetof(a::borrow, credential) == 0);
+    static_assert(!has_member_ptr<a::borrow>::value,
+                  "v2 borrow must not carry a peer pointer");
+    // v2 protocol contract: iid, major, minor = 16 + 4 + 4 padded to 24.
+    static_assert(sizeof(a::contract) == 24 && alignof(a::contract) == 8);
+    static_assert(offsetof(a::contract, id) == 0);
+    static_assert(offsetof(a::contract, major) == 16);
+    static_assert(offsetof(a::contract, minor) == 20);
     static_assert(sizeof(a::plug_desc) == 56 && alignof(a::plug_desc) == 8);
     static_assert(offsetof(a::plug_desc, plug_id) == 8);
     static_assert(offsetof(a::plug_desc, version) == 16);
@@ -768,18 +881,24 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(sizeof(a::method_desc) == 40 && alignof(a::method_desc) == 8);
     static_assert(offsetof(a::method_desc, name) == 8);
     static_assert(offsetof(a::method_desc, output_schema) == 32);
-    static_assert(sizeof(a::caps_desc) == 32 && alignof(a::caps_desc) == 8);
-    static_assert(offsetof(a::caps_desc, interfaces) == 8);
-    static_assert(offsetof(a::caps_desc, method_count) == 16);
-    static_assert(offsetof(a::caps_desc, methods) == 24);
+    // v2 caps_desc: struct_size, method_count, methods, protocol(inline contract) = 40; the v1
+    // interface list that used to sit at offset 8 is gone.
+    static_assert(sizeof(a::caps_desc) == 40 && alignof(a::caps_desc) == 8);
+    static_assert(offsetof(a::caps_desc, struct_size) == 0);
+    static_assert(offsetof(a::caps_desc, method_count) == 4);
+    static_assert(offsetof(a::caps_desc, methods) == 8);
+    static_assert(offsetof(a::caps_desc, protocol) == 16);
+    static_assert(offsetof(a::caps_desc, protocol.major) == 32);
     static_assert(sizeof(a::event) == 24 && alignof(a::event) == 8);
     static_assert(offsetof(a::event, payload) == 8);
     static_assert(offsetof(a::event, payload.data) == 8);
     static_assert(offsetof(a::event, payload.size) == 16);
-    static_assert(sizeof(a::cap_event) == 48 && alignof(a::cap_event) == 8);
+    // cap_event keeps plug_id/available/capabilities; the nested caps_desc growth moves it to 56.
+    static_assert(sizeof(a::cap_event) == 56 && alignof(a::cap_event) == 8);
     static_assert(offsetof(a::cap_event, plug_id) == 0);
     static_assert(offsetof(a::cap_event, available) == 8);
     static_assert(offsetof(a::cap_event, capabilities) == 16);
+    static_assert(offsetof(a::cap_event, capabilities.protocol) == 16 + 16);
 #else
     // Profiles whose pointers are not 64 bit wide: no literal size is pinned here. Changing the
     // data model changes the offsets and sizes (a 4-byte pointer moves every pointer field and
@@ -827,11 +946,12 @@ TEST_CASE(interface_signatures_are_frozen)
     U42_FROZEN_SIG(a::icaps, announce, a::status, const a::caps_desc*);
     U42_FROZEN_SIG(a::icaps, watch, a::status, a::icap_sink*, a::token*);
     U42_FROZEN_SIG(a::icaps, unwatch, a::status, a::token);
-    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::iid*, a::irevoker*, a::borrow*);
+    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::contract*, a::irevoker*,
+                   a::borrow*);
     U42_FROZEN_SIG(a::icaps, release, a::status, a::token);
 
-    U42_FROZEN_SIG(a::icalls, bind_name, a::status, const char*, const char*, a::binding*);
-    U42_FROZEN_SIG(a::icalls, bind_id, a::status, const char*, a::method_id, a::binding*);
+    U42_FROZEN_SIG(a::icalls, bind_name, a::status, a::token, const char*, a::binding*);
+    U42_FROZEN_SIG(a::icalls, bind_id, a::status, a::token, a::method_id, a::binding*);
     U42_FROZEN_SIG(a::icalls, call, a::status, a::binding, a::bytes, a::iwriter*);
     U42_FROZEN_SIG(a::icalls, unbind, a::status, a::binding);
 
@@ -868,25 +988,152 @@ TEST_CASE(interface_signatures_are_frozen)
                                                                     std::uint64_t*) noexcept>);
 }
 
+TEST_CASE(contract_helpers_validate_identity_and_version_boundaries)
+{
+    // Signature and noexcept are part of the frozen contract: these are pure constexpr helpers.
+    static_assert(std::is_same_v<decltype(&a::valid_contract), bool (*)(a::contract) noexcept>);
+    static_assert(std::is_same_v<decltype(&a::compatible_contract),
+                                 bool (*)(a::contract, a::contract) noexcept>);
+    static_assert(noexcept(a::valid_contract(a::contract{})));
+    static_assert(noexcept(a::compatible_contract(a::contract{}, a::contract{})));
+
+    constexpr a::iid family_a{0x4142495f54455354ULL, 1};
+    constexpr a::iid family_b{0x4142495f54455354ULL, 2};
+
+    // valid_contract: a named family with a positive major. Only "both halves zero" is unnamed, so
+    // a single nonzero half is already a usable identity.
+    static_assert(!a::valid_contract(a::contract{}));
+    static_assert(!a::valid_contract(a::contract{{0, 0}, 1, 0}));
+    static_assert(!a::valid_contract(a::contract{family_a, 0, 0}));
+    static_assert(!a::valid_contract(a::contract{family_a, 0, 7}));
+    static_assert(a::valid_contract(a::contract{family_a, 1, 0}));
+    static_assert(a::valid_contract(a::contract{{0, 1}, 1, 0}));
+    static_assert(a::valid_contract(a::contract{{1, 0}, 1, 0}));
+    static_assert(a::valid_contract(a::contract{family_a, 1, 0xFFFFFFFFu}));
+
+    // compatible_contract: identical identity and major, offered minor >= required minor. The minor
+    // boundary is inclusive, and one step below it must fail.
+    static_assert(a::compatible_contract(a::contract{family_a, 1, 0}, a::contract{family_a, 1, 0}));
+    static_assert(a::compatible_contract(a::contract{family_a, 1, 5}, a::contract{family_a, 1, 5}));
+    static_assert(a::compatible_contract(a::contract{family_a, 1, 6}, a::contract{family_a, 1, 5}));
+    static_assert(a::compatible_contract(a::contract{family_a, 1, 0xFFFFFFFFu},
+                                         a::contract{family_a, 1, 0xFFFFFFFEu}));
+    static_assert(!a::compatible_contract(a::contract{family_a, 1, 4}, a::contract{family_a, 1, 5}),
+                  "a provider promising an older minor must be rejected");
+    static_assert(!a::compatible_contract(a::contract{family_a, 2, 9}, a::contract{family_a, 1, 0}),
+                  "a different major is a different wire format, not a newer minor");
+    static_assert(!a::compatible_contract(a::contract{family_a, 1, 9}, a::contract{family_b, 1, 0}),
+                  "the low half is part of the identity, not just the version tag");
+    static_assert(!a::compatible_contract(a::contract{}, a::contract{family_a, 1, 0}));
+    static_assert(!a::compatible_contract(a::contract{family_a, 1, 0}, a::contract{}));
+    static_assert(!a::compatible_contract(a::contract{family_a, 0, 9}, a::contract{family_a, 0, 0}));
+
+    // constexpr means the verdict exists at compile time; the CHECKs re-run it on real values.
+    constexpr a::contract offered{family_a, 1, 3};
+    constexpr a::contract equal{family_a, 1, 3};
+    constexpr a::contract older{family_a, 1, 2};
+    constexpr a::contract newer{family_a, 1, 4};
+    static_assert(a::compatible_contract(offered, equal));
+    static_assert(a::compatible_contract(offered, older));
+    static_assert(!a::compatible_contract(offered, newer));
+    CHECK(a::compatible_contract(offered, equal));
+    CHECK(a::compatible_contract(offered, older));
+    CHECK(!a::compatible_contract(offered, newer));
+    CHECK(a::compatible_contract(a::contract{family_a, 1, 0}, a::contract{family_a, 1, 0}));
+    CHECK(a::valid_contract(a::contract{family_a, 1, 0}));
+    CHECK(!a::valid_contract(a::contract{}));
+}
+
+TEST_CASE(credential_first_calls_cannot_expose_a_peer_pointer)
+{
+    // A lease is a credential, never an address: one token wide, with no member able to hold a
+    // pointer, and not convertible into a pointer-typed value.
+    static_assert(!has_member_ptr<a::borrow>::value);
+    static_assert(sizeof(a::borrow) == sizeof(a::token));
+    static_assert(sizeof(a::token) == sizeof(std::uint64_t));
+    static_assert(std::is_same_v<decltype(a::borrow::credential), a::token>);
+    static_assert(!std::is_pointer_v<a::borrow>);
+    static_assert(!std::is_convertible_v<a::borrow, void*>);
+    static_assert(!std::is_convertible_v<a::borrow, const void*>);
+    static_assert(!std::is_same_v<a::borrow, a::token>,
+                  "the lease must stay a distinct type from a bare credential");
+
+    // The credential is the first parameter of every bind, and the required protocol is the second
+    // parameter of acquire; the v1 plug_id/iid forms must not even resolve.
+    U42_FROZEN_SIG(a::icalls, bind_name, a::status, a::token, const char*, a::binding*);
+    U42_FROZEN_SIG(a::icalls, bind_id, a::status, a::token, a::method_id, a::binding*);
+    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::contract*, a::irevoker*,
+                   a::borrow*);
+
+    using bind_name_member = decltype(&a::icalls::bind_name);
+    using bind_id_member = decltype(&a::icalls::bind_id);
+    using acquire_member = decltype(&a::icaps::acquire);
+
+    static_assert(!std::is_invocable_v<bind_name_member, a::icalls*, const char*, const char*,
+                                       a::binding*>,
+                  "v1 bind_name(plug_id, name, out) must no longer exist");
+    static_assert(!std::is_invocable_v<bind_id_member, a::icalls*, const char*, a::method_id,
+                                       a::binding*>,
+                  "v1 bind_id(plug_id, id, out) must no longer exist");
+    static_assert(!std::is_invocable_v<acquire_member, a::icaps*, const char*, const a::iid*,
+                                       a::irevoker*, a::borrow*>,
+                  "v1 acquire(plug_id, iid, receiver, out) must no longer exist");
+    static_assert(std::is_invocable_v<bind_name_member, a::icalls*, a::token, const char*,
+                                      a::binding*>);
+    static_assert(std::is_invocable_v<acquire_member, a::icaps*, const char*, const a::contract*,
+                                      a::irevoker*, a::borrow*>);
+
+    // caps_desc publishes a method list and an inline protocol, not a cross-plugin interface list.
+    static_assert(!has_member_interfaces<a::caps_desc>::value);
+    static_assert(!has_member_interface_count<a::caps_desc>::value);
+
+    // A credential cannot be produced from a plug id or an address by implicit conversion, so the
+    // mandatory lease really is mandatory.
+    static_assert(!std::is_constructible_v<a::token, const char*>);
+    static_assert(!std::is_constructible_v<a::token, void*>);
+    static_assert(!std::is_convertible_v<const char*, a::token>);
+    static_assert(!std::is_convertible_v<void*, a::token>);
+
+    // Runtime restatement of the same shape: the whole lease is its credential, byte for byte.
+    const a::borrow lease{a::token{0x42u}};
+    const a::borrow copied = lease;
+    CHECK(lease.credential.value == 0x42u);
+    CHECK(copied.credential.value == 0x42u);
+    CHECK(sizeof(a::borrow) == sizeof(lease.credential));
+}
+
 TEST_CASE(opaque_values_default_to_the_documented_invalid_zero)
 {
     static_assert(a::token{}.value == 0);
     static_assert(a::binding{}.value == 0);
     static_assert(std::is_same_v<decltype(a::token::value), std::uint64_t>);
     static_assert(std::is_same_v<decltype(a::binding::value), std::uint64_t>);
-    static_assert(a::borrow{}.ptr == nullptr && a::borrow{}.credential.value == 0);
+    static_assert(std::is_same_v<decltype(a::borrow::credential), a::token>);
+    static_assert(a::borrow{}.credential.value == 0);
+    static_assert(!has_member_ptr<a::borrow>::value,
+                  "the lease carries a credential, never an address");
+    static_assert(a::contract{}.id == a::iid{});
+    static_assert(a::contract{}.major == 0 && a::contract{}.minor == 0);
+    static_assert(std::is_same_v<decltype(a::contract::id), a::iid>);
+    static_assert(std::is_same_v<decltype(a::contract::major), std::uint32_t>);
+    static_assert(std::is_same_v<decltype(a::contract::minor), std::uint32_t>);
     static_assert(a::bytes{}.data == nullptr && a::bytes{}.size == 0);
 
     // Zero is the documented invalid credential, and it must not be reachable by accident.
     const a::token empty_token{};
     const a::binding empty_binding{};
     const a::borrow empty_borrow{};
+    const a::contract empty_contract{};
     const a::bytes empty_bytes{};
     CHECK(empty_token.value == 0);
     CHECK(empty_binding.value == 0);
-    CHECK(empty_borrow.ptr == nullptr);
     CHECK(empty_borrow.credential.value == 0);
+    CHECK(!a::valid_contract(empty_contract)); // an all-zero protocol is never requestable
     CHECK(empty_bytes.data == nullptr && empty_bytes.size == 0);
+
+    // A populated lease still exposes nothing but its credential.
+    const a::borrow lease{a::token{0x1234u}};
+    CHECK(lease.credential.value == 0x1234u);
 }
 
 TEST_CASE(bytes_rule_has_a_concrete_reference_shape)
@@ -918,6 +1165,13 @@ TEST_CASE(mock_entry_rejects_major_mismatch_and_clears_output)
     a::iplug_fty* out = stale_sentinel<a::iplug_fty>();
     CHECK(u42_abi_test_mock_entry(a::abi_major + 1, &out) == a::unsupported);
     CHECK(out == nullptr); // A rejected negotiation never leaves a stale factory behind.
+
+    // The previous profile is rejected by value, not by accident: a host asking for v1 must not be
+    // handed a v2 factory. Rejecting a *real* v1 shared object is a separate integration test that
+    // this dependency-free file cannot perform.
+    out = stale_sentinel<a::iplug_fty>();
+    CHECK(u42_abi_test_mock_entry(1u, &out) == a::unsupported);
+    CHECK(out == nullptr);
 
     out = stale_sentinel<a::iplug_fty>();
     CHECK(u42_abi_test_mock_entry(0, &out) == a::invalid_argument);
@@ -1076,6 +1330,30 @@ TEST_CASE(mock_context_query_publishes_adjusted_interface_pointers)
     CHECK(cleared == nullptr);
     CHECK(host->query(&a::events_iid, nullptr) == a::invalid_argument);
     CHECK(ctx.state.query_calls == 5);
+
+    // v2 lease negotiation is credential-only. The bare stand-in cannot grant a lease, so what it
+    // verifies here is the shape of the output slot: a rejection never leaves a stale credential
+    // (let alone an address) for the caller, and the receiver is never called without a live lease.
+    mock_revoker revoker;
+    a::icaps* const caps = static_cast<a::icaps*>(&ctx);
+    const a::contract required{{0x4142495f54455354ULL, 1}, 1, 0};
+    a::borrow lease{a::token{0xDEADBEEFu}};
+    CHECK(caps->acquire("u42.test.mock", &required, &revoker, &lease) == a::unsupported);
+    CHECK(lease.credential.value == 0);
+    CHECK(revoker.calls == 0);
+
+    a::borrow no_plug_id{a::token{7}};
+    CHECK(caps->acquire(nullptr, &required, &revoker, &no_plug_id) == a::invalid_argument);
+    CHECK(no_plug_id.credential.value == 0);
+    a::borrow no_protocol{a::token{7}};
+    CHECK(caps->acquire("u42.test.mock", nullptr, &revoker, &no_protocol) == a::invalid_argument);
+    CHECK(no_protocol.credential.value == 0);
+    a::borrow no_receiver{a::token{7}};
+    CHECK(caps->acquire("u42.test.mock", &required, nullptr, &no_receiver) == a::invalid_argument);
+    CHECK(no_receiver.credential.value == 0);
+    // A null lease output is a parameter error, and the required pointer rules make it unreachable.
+    CHECK(caps->acquire("u42.test.mock", &required, &revoker, nullptr) == a::invalid_argument);
+    CHECK(ctx.state.caps_calls == 5); // the unwatch above plus four reached acquire calls
 }
 
 std::vector<test_case>& tests()

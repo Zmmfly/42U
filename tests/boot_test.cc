@@ -23,6 +23,10 @@
  * plugin candidates. The provider and two created fixture paths are staged independently so the
  * test can distinguish pre-existing dynamic records from a newly scanned boot batch.
  *
+ * @note The provider fixture shares no interface type with the test binary. It publishes a plain
+ *       data contract and exposes only the host-private iinvoke through iplug::query, so the
+ *       consumer acquires a lease, binds the method and reaches the provider exclusively through
+ *       icalls - the only business path ABI v2 allows.
  * @note This test replaces the process-wide allocation functions and must remain an independent
  *       binary, like withdraw_test. It deliberately includes the private engine contract to
  *       construct the otherwise-unobservable pre-existing Created dynamic-record state.
@@ -32,28 +36,35 @@
 
 #include <cstdint>
 
+/**
+ * @brief Data-only contract shared by the provider fixture and the test binary.
+ *
+ * @note Both sides see exactly these constants because the same source file is compiled once per
+ *       fixture macro and once as the test executable, so no header, interface type or virtual
+ *       class crosses the DSO boundary.
+ */
 namespace boot_contract {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
 
-/** @brief Test-only interface borrowed across the real shared-library boundary. */
-struct iping {
-    /**
-     * @brief Return a stable marker proving that the borrowed provider is still callable.
-     *
-     * @param out Receives the marker on success.
-     * @return ok on success or invalid_argument for a null output.
-     */
-    virtual abi::status U42_CALL ping(std::uint64_t* out) noexcept = 0;
-
-protected:
-    ~iping() = default;
-};
-
-/** @brief Frozen identifier for the test-only ping interface. */
-inline constexpr abi::iid ping_iid{0x3432555f424f4f54ULL, 0x50494e4700000001ULL};
-/** @brief Value returned by iping::ping(). */
-inline constexpr std::uint64_t ping_marker = 0x42b007c0ffee1234ULL;
+/** @brief Test-only protocol family announced by the provider fixture. */
+inline constexpr abi::iid provider_iid{0x424f4f545f50524fULL, 1};
+/** @brief Protocol the provider announces and the consumer requires: major 1, minor 0. */
+inline constexpr abi::contract provider_contract{provider_iid, 1, 0};
+/** @brief Same family and major with a higher minimum minor, which the provider must refuse. */
+inline constexpr abi::contract provider_contract_minor2{provider_iid, 1, 1};
+/** @brief Numeric identifier of the fixture's single marker method. */
+inline constexpr abi::method_id marker_method_id = 1;
+/** @brief Published name of the fixture's marker method. */
+inline constexpr char marker_method_name[] = "marker";
+/** @brief Human-readable summary of the fixture's marker method. */
+inline constexpr char marker_method_description[] = "Return the fixed marker JSON object.";
+/** @brief Input schema of the fixture's marker method. */
+inline constexpr char marker_input_schema[] = "{\"type\":\"object\"}";
+/** @brief Output schema of the fixture's marker method. */
+inline constexpr char marker_output_schema[] = "{\"type\":\"object\"}";
+/** @brief Exact JSON object a successful invoke() must deliver. */
+inline constexpr char marker_json[] = "{\"marker\":\"42b007c0ffee1234\"}";
 
 } // namespace boot_contract
 
@@ -65,40 +76,46 @@ inline constexpr std::uint64_t ping_marker = 0x42b007c0ffee1234ULL;
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
 
 #if defined(U42_BOOT_PROVIDER_FIXTURE)
 constexpr char fixture_id[] = "com.example.boot.provider";
-constexpr bool fixture_provides_ping = true;
+constexpr bool fixture_provides_marker = true;
 constexpr abi::status fixture_start_status = abi::ok;
 #elif defined(U42_BOOT_CREATED_A_FIXTURE)
 constexpr char fixture_id[] = "com.example.boot.created.a";
-constexpr bool fixture_provides_ping = false;
+constexpr bool fixture_provides_marker = false;
 constexpr abi::status fixture_start_status = abi::ok;
 #elif defined(U42_BOOT_CREATED_B_FIXTURE)
 constexpr char fixture_id[] = "com.example.boot.created.b";
-constexpr bool fixture_provides_ping = false;
+constexpr bool fixture_provides_marker = false;
 constexpr abi::status fixture_start_status = abi::ok;
 #elif defined(U42_BOOT_BATCH_GOOD_FIXTURE)
 constexpr char fixture_id[] = "com.example.boot.batch.a-good";
-constexpr bool fixture_provides_ping = false;
+constexpr bool fixture_provides_marker = false;
 constexpr abi::status fixture_start_status = abi::ok;
 #elif defined(U42_BOOT_BATCH_FAIL_FIXTURE)
 constexpr char fixture_id[] = "com.example.boot.batch.m-fail";
-constexpr bool fixture_provides_ping = false;
+constexpr bool fixture_provides_marker = false;
 constexpr abi::status fixture_start_status = abi::failed;
 #else
 constexpr char fixture_id[] = "com.example.boot.batch.z-tail";
-constexpr bool fixture_provides_ping = false;
+constexpr bool fixture_provides_marker = false;
 constexpr abi::status fixture_start_status = abi::ok;
 #endif
 
-constexpr char fixture_version[] = "boot-test-1";
+constexpr char fixture_version[] = "boot-test-2";
 const abi::plug_desc fixture_description{sizeof(abi::plug_desc), 0, fixture_id, fixture_version,
                                          0, 0, nullptr, 0, nullptr};
 
-/** @brief One fixture instance; successful variants announce their complete capability set. */
-class fixture_plugin final : public abi::iplug, public boot_contract::iping {
+/**
+ * @brief One fixture instance.
+ *
+ * @note Only the provider variant publishes a business contract and implements iinvoke. The
+ *       other variants disclose the legal empty capability set (no contract, no methods), so
+ *       they publish no business authority at all and are never acquirable.
+ */
+class fixture_plugin final : public abi::iplug, public abi::iinvoke {
 public:
     abi::status U42_CALL init(abi::ictx* ctx) noexcept override
     {
@@ -115,14 +132,26 @@ public:
     {
         if (fixture_start_status != abi::ok) return fixture_start_status;
         if (caps_ == nullptr || started_) return abi::invalid_state;
-        abi::caps_desc capabilities{};
-        if (fixture_provides_ping) {
-            capabilities.interface_count = 1;
-            capabilities.interfaces = &boot_contract::ping_iid;
+        try {
+            // The local array only has to survive this call: announce() copies every method it
+            // accepts, so no fixture-side storage outlives start().
+            const abi::method_desc methods[]{
+                {boot_contract::marker_method_id, boot_contract::marker_method_name,
+                 boot_contract::marker_method_description, boot_contract::marker_input_schema,
+                 boot_contract::marker_output_schema},
+            };
+            abi::caps_desc capabilities{};
+            if (fixture_provides_marker) {
+                capabilities.method_count = 1;
+                capabilities.methods = methods;
+                capabilities.protocol = boot_contract::provider_contract;
+            }
+            const abi::status outcome = caps_->announce(&capabilities);
+            if (outcome == abi::ok) started_ = true;
+            return outcome;
+        } catch (...) {
+            return abi::failed;
         }
-        const abi::status outcome = caps_->announce(&capabilities);
-        if (outcome == abi::ok) started_ = true;
-        return outcome;
     }
 
     abi::status U42_CALL stop() noexcept override
@@ -133,23 +162,50 @@ public:
 
     void U42_CALL destroy() noexcept override { delete this; }
 
+    /**
+     * @brief Return the host-private iinvoke interface, never a cross-plugin business query.
+     *
+     * @param type Requested interface identifier.
+     * @param out Cleared first; receives the invoker for a provider fixture.
+     * @return ok when invoke_iid was requested by a provider, otherwise unsupported.
+     */
     abi::status U42_CALL query(const abi::iid* type, void** out) noexcept override
     {
         if (out == nullptr) return abi::invalid_argument;
         *out = nullptr;
         if (type == nullptr) return abi::invalid_argument;
-        if (fixture_provides_ping && *type == boot_contract::ping_iid) {
-            *out = static_cast<boot_contract::iping*>(this);
+        if (fixture_provides_marker && *type == abi::invoke_iid) {
+            *out = static_cast<abi::iinvoke*>(this);
             return abi::ok;
         }
         return abi::unsupported;
     }
 
-    abi::status U42_CALL ping(std::uint64_t* out) noexcept override
+    /**
+     * @brief Deliver the frozen marker JSON for the single published method.
+     *
+     * @param method Requested provider-local method identifier.
+     * @param args Borrowed input; the fixture accepts and ignores any payload.
+     * @param result Required caller-owned writer.
+     * @return ok after the marker was written, invalid_argument for a null writer,
+     *         unsupported for a non-provider variant, not_found for an unannounced method, or
+     *         invalid_state before start().
+     */
+    abi::status U42_CALL invoke(abi::method_id method, abi::bytes args,
+                                abi::iwriter* result) noexcept override
     {
-        if (out == nullptr) return abi::invalid_argument;
-        *out = boot_contract::ping_marker;
-        return started_ ? abi::ok : abi::invalid_state;
+        (void)args;
+        if (result == nullptr) return abi::invalid_argument;
+        if (!fixture_provides_marker) return abi::unsupported;
+        if (method != boot_contract::marker_method_id) return abi::not_found;
+        if (!started_) return abi::invalid_state;
+        try {
+            return result->write(abi::bytes{boot_contract::marker_json,
+                                            static_cast<std::uint64_t>(
+                                                sizeof(boot_contract::marker_json) - 1)});
+        } catch (...) {
+            return abi::failed;
+        }
     }
 
 private:
@@ -364,7 +420,7 @@ void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept { s
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
 namespace fs = std::filesystem;
 using u42::detail::engine;
 using u42::detail::phase;
@@ -419,11 +475,16 @@ public:
     abi::status U42_CALL init(abi::ictx* ctx) noexcept override
     {
         if (ctx == nullptr) return abi::invalid_argument;
+        if (caps_ != nullptr || calls_ != nullptr) return abi::invalid_state;
         void* raw = nullptr;
-        const abi::status outcome = ctx->query(&abi::caps_iid, &raw);
-        if (outcome != abi::ok) return outcome;
+        const abi::status caps_status = ctx->query(&abi::caps_iid, &raw);
+        if (caps_status != abi::ok) return caps_status;
         caps_ = static_cast<abi::icaps*>(raw);
-        return caps_ != nullptr ? abi::ok : abi::failed;
+        raw = nullptr;
+        const abi::status calls_status = ctx->query(&abi::calls_iid, &raw);
+        if (calls_status != abi::ok) return calls_status;
+        calls_ = static_cast<abi::icalls*>(raw);
+        return caps_ != nullptr && calls_ != nullptr ? abi::ok : abi::failed;
     }
 
     abi::status U42_CALL start() noexcept override
@@ -437,9 +498,8 @@ public:
         active_ = false;
         if (lease_.credential.value != 0 && caps_ != nullptr) {
             const abi::status released = caps_->release(lease_.credential);
-            if (released == abi::ok || released == abi::stale) lease_ = {};
+            if (released == abi::ok || released == abi::stale) lease_ = abi::borrow{};
         }
-        iface_ = nullptr;
         return abi::ok;
     }
 
@@ -458,31 +518,50 @@ public:
         const abi::status released = caps_->release(credential);
         if ((released == abi::ok || released == abi::stale) &&
             credential.value == lease_.credential.value) {
-            lease_ = {};
-            iface_ = nullptr;
+            lease_ = abi::borrow{};
         }
     }
 
+    /**
+     * @brief Lease the dynamic provider under the explicitly accepted test protocol.
+     *
+     * @return ok with a stored credential, unsupported for an incompatible protocol, or the
+     *         host status; a refused acquire never changes the held lease.
+     */
     abi::status acquire_provider() noexcept
     {
         if (!active_ || caps_ == nullptr) return abi::invalid_state;
+        if (lease_.credential.value != 0) return abi::invalid_state;
         abi::borrow next{};
-        const abi::status outcome = caps_->acquire(provider_id, &boot_contract::ping_iid,
-                                                   this, &next);
-        if (outcome == abi::ok) {
-            lease_ = next;
-            iface_ = static_cast<boot_contract::iping*>(next.ptr);
-        }
+        const abi::status outcome =
+            caps_->acquire(provider_id, &boot_contract::provider_contract, this, &next);
+        if (outcome == abi::ok) lease_ = next;
         return outcome;
     }
 
-    abi::status ping_provider() noexcept
+    /**
+     * @brief Reach the provider through lease -> bind -> icalls::call and compare the marker.
+     *
+     * @param out Receives the delivered payload; cleared first.
+     * @return ok only when the provider delivered the exact frozen marker JSON.
+     * @note No provider pointer is ever stored: the lease credential names the instance and the
+     *       binding only exists while that credential does.
+     */
+    abi::status invoke_provider(std::string& out) noexcept
     {
-        if (iface_ == nullptr) return abi::invalid_state;
-        std::uint64_t value = 0;
-        const abi::status outcome = iface_->ping(&value);
+        out.clear();
+        if (calls_ == nullptr || lease_.credential.value == 0) return abi::invalid_state;
+        abi::binding target{};
+        abi::status outcome =
+            calls_->bind_name(lease_.credential, boot_contract::marker_method_name, &target);
         if (outcome != abi::ok) return outcome;
-        return value == boot_contract::ping_marker ? abi::ok : abi::failed;
+        u42::detail::string_writer writer(1024);
+        outcome = calls_->call(target, abi::bytes{nullptr, 0}, &writer);
+        const abi::status dropped = calls_->unbind(target);
+        if (outcome != abi::ok) return outcome;
+        if (dropped != abi::ok) return dropped;
+        out = writer.value;
+        return out == boot_contract::marker_json ? abi::ok : abi::failed;
     }
 
     abi::token credential() const noexcept { return lease_.credential; }
@@ -490,8 +569,8 @@ public:
 private:
     class static_consumer_factory& owner_;
     abi::icaps* caps_ = nullptr;
+    abi::icalls* calls_ = nullptr;
     abi::borrow lease_{};
-    boot_contract::iping* iface_ = nullptr;
     bool active_ = false;
 };
 
@@ -575,7 +654,9 @@ public:
         CHECK(rack.load(provider_library) == abi::ok);
         CHECK(consumer_factory.instance() != nullptr);
         CHECK(consumer_factory.instance()->acquire_provider() == abi::ok);
-        CHECK(consumer_factory.instance()->ping_provider() == abi::ok);
+        std::string marker;
+        CHECK(consumer_factory.instance()->invoke_provider(marker) == abi::ok);
+        CHECK(marker == boot_contract::marker_json);
         CHECK(runtime().leases.size() == 1);
     }
 
@@ -631,6 +712,15 @@ preserved_state capture(snapshot_rack& fixture)
     return state;
 }
 
+/**
+ * @brief Require the pre-existing graph, its lease and its real invocation to be untouched.
+ *
+ * @param fixture Rack that survived the injected allocation failure.
+ * @param state Pointer, generation and credential snapshot taken before the failure.
+ * @note The invocation travels through the retained credential (lease -> bind -> icalls::call),
+ *       so a record that lost its lease, its binding path or its provider invoker fails here
+ *       instead of only in a pointer comparison.
+ */
 void verify_preserved(snapshot_rack& fixture, const preserved_state& state)
 {
     engine& runtime = fixture.runtime();
@@ -653,8 +743,16 @@ void verify_preserved(snapshot_rack& fixture, const preserved_state& state)
     CHECK(runtime.leases.count(state.credential.value) == 1);
     CHECK(runtime.leases.at(state.credential.value).consumer == state.consumer);
     CHECK(runtime.leases.at(state.credential.value).provider == state.provider);
+    CHECK(runtime.leases.at(state.credential.value).protocol.id == boot_contract::provider_iid);
+    CHECK(runtime.leases.at(state.credential.value).protocol.major ==
+          boot_contract::provider_contract.major);
+    CHECK(runtime.leases.at(state.credential.value).generation == state.provider_generation);
     CHECK(fixture.consumer().credential().value == state.credential.value);
-    CHECK(fixture.consumer().ping_provider() == abi::ok);
+    std::string marker;
+    CHECK(fixture.consumer().invoke_provider(marker) == abi::ok);
+    CHECK(marker == boot_contract::marker_json);
+    // invoke_provider() unbinds what it bound, so the failure injection left no orphan binding.
+    CHECK(runtime.bindings.empty());
 }
 
 /**
@@ -819,7 +917,9 @@ void test_new_batch_start_failure(const fs::path& provider_library,
     CHECK(runtime.leases.at(credential.value).consumer == old_consumer);
     CHECK(runtime.leases.at(credential.value).provider == old_provider);
     CHECK(fixture.consumer().credential().value == credential.value);
-    CHECK(fixture.consumer().ping_provider() == abi::ok);
+    std::string marker;
+    CHECK(fixture.consumer().invoke_provider(marker) == abi::ok);
+    CHECK(marker == boot_contract::marker_json);
 }
 
 /**
@@ -872,7 +972,9 @@ void test_boot_fallback_cleanup(const fs::path& provider_library,
     CHECK(runtime.leases.at(credential.value).consumer == old_consumer);
     CHECK(runtime.leases.at(credential.value).provider == old_provider);
     CHECK(fixture.consumer().credential().value == credential.value);
-    CHECK(fixture.consumer().ping_provider() == abi::ok);
+    std::string marker;
+    CHECK(fixture.consumer().invoke_provider(marker) == abi::ok);
+    CHECK(marker == boot_contract::marker_json);
     std::printf("boot_test: fallback cleanup used prefix %ld and start offsets %ld/%ld\n",
                 prefix, relative.first, relative.second);
 }
@@ -897,23 +999,110 @@ void expect_oom_safe_rejection(u42::host& rack, Operation operation)
     CHECK(outcome == abi::invalid_argument);
 }
 
+/** @brief Revocation target used only to supply a valid receiver to acquire() rejections. */
+struct unused_revoker final : abi::irevoker {
+    /** @brief Never expected to run: every acquire() below is rejected before a lease exists. */
+    void U42_CALL on_revoke(abi::token) noexcept override {}
+};
+
 /** @brief Public native parameter checks must remain allocation-failure-safe and non-throwing. */
 void test_native_parameter_rejections_do_not_throw()
 {
     g_current_test = "native-parameter-rejection-oom";
     u42::host rack;
     std::string output;
+    unused_revoker revoker;
+    abi::borrow lease{};
+    abi::binding binding{};
     const abi::bytes empty{nullptr, 0};
     const abi::bytes invalid{nullptr, 1};
 
-    expect_oom_safe_rejection(rack, [&]() { return rack.bind("missing", "method", nullptr); });
-    expect_oom_safe_rejection(rack, [&]() { return rack.bind("missing", abi::method_id{1}, nullptr); });
+    // ABI v2 native boundary: every entry point rejects a missing required pointer, a zero
+    // credential or a zero binding before it consults the engine, so a rejection cannot allocate
+    // a diagnostic. The harness swaps the diagnostic back to SSO capacity and arms a failure at
+    // the very next allocation, so each lambda has to return invalid_argument without throwing.
+    expect_oom_safe_rejection(rack, [&]() { return rack.protocol("missing", nullptr); });
+    expect_oom_safe_rejection(
+        rack,
+        [&]() { return rack.acquire("missing", boot_contract::provider_contract, nullptr, &lease); });
+    expect_oom_safe_rejection(
+        rack,
+        [&]() { return rack.acquire("missing", boot_contract::provider_contract, &revoker, nullptr); });
+    expect_oom_safe_rejection(rack, [&]() { return rack.release(abi::token{}); });
+    expect_oom_safe_rejection(rack, [&]() { return rack.bind(abi::token{}, "marker", nullptr); });
+    expect_oom_safe_rejection(rack, [&]() { return rack.bind(abi::token{}, abi::method_id{1}, nullptr); });
+    expect_oom_safe_rejection(rack, [&]() { return rack.bind(abi::token{}, "marker", &binding); });
     expect_oom_safe_rejection(rack, [&]() { return rack.unbind(abi::binding{}); });
-    expect_oom_safe_rejection(rack, [&]() { return rack.call(abi::binding{1}, empty, nullptr); });
-    expect_oom_safe_rejection(rack, [&]() { return rack.call("missing", "method", empty, nullptr); });
-    expect_oom_safe_rejection(rack, [&]() { return rack.call("missing", abi::method_id{1}, empty, nullptr); });
-    expect_oom_safe_rejection(rack, [&]() { return rack.call(abi::binding{}, empty, &output); });
-    expect_oom_safe_rejection(rack, [&]() { return rack.call(abi::binding{1}, invalid, &output); });
+    expect_oom_safe_rejection(rack, [&]() { return rack.call(abi::binding{}, empty, nullptr); });
+    expect_oom_safe_rejection(rack, [&]() { return rack.call(abi::binding{}, invalid, &output); });
+    expect_oom_safe_rejection(rack, [&]() {
+        return rack.call("missing", boot_contract::provider_contract, "marker", empty, nullptr);
+    });
+    expect_oom_safe_rejection(rack, [&]() {
+        return rack.call("missing", boot_contract::provider_contract, abi::method_id{1}, empty,
+                         nullptr);
+    });
+}
+
+/**
+ * @brief Inject each one-shot call allocation while preserving an unrelated live dependency.
+ *
+ * This checks temporary receiver lifetime and cleanup in the durable suite rather than relying
+ * only on an external audit probe. Arguments are prepared before arming: caller-side string
+ * construction is not part of the native exception-to-status boundary.
+ */
+void test_one_shot_allocation_failures(const fs::path& provider_library)
+{
+    g_current_test = "one-shot-allocation-failures";
+    const std::string id = provider_id;
+    const std::string method = boot_contract::marker_method_name;
+    const abi::bytes empty{nullptr, 0};
+    long allocations = 0;
+    {
+        active_rack measured(provider_library);
+        std::string output = "sentinel";
+        const long before = g_new_calls.load(std::memory_order_relaxed);
+        CHECK(measured.rack.call(id, boot_contract::provider_contract, method, empty, &output) == abi::ok);
+        allocations = g_new_calls.load(std::memory_order_relaxed) - before;
+        CHECK(output == boot_contract::marker_json);
+    }
+    CHECK(allocations > 0);
+    long failures = 0;
+    for (long offset = 0; offset <= allocations; ++offset) {
+        active_rack fixture(provider_library);
+        const abi::token existing = fixture.consumer().credential();
+        std::string output = "sentinel";
+        arm_fail_at(g_new_calls.load(std::memory_order_relaxed) + offset);
+        abi::status outcome = abi::ok;
+        bool threw = false;
+        try {
+            outcome = fixture.rack.call(id, boot_contract::provider_contract, method, empty, &output);
+        } catch (...) {
+            threw = true;
+        }
+        disarm_fail();
+        CHECK(!threw);
+        if (outcome == abi::failed) {
+            ++failures;
+            CHECK(output.empty());
+        } else {
+            CHECK(outcome == abi::ok);
+            CHECK(output == boot_contract::marker_json);
+        }
+        CHECK(fixture.runtime().leases.size() == 1);
+        CHECK(fixture.runtime().leases.count(existing.value) == 1);
+        CHECK(fixture.runtime().bindings.empty());
+        // Recovery and final revocation would expose a dangling temporary receiver under ASan.
+        CHECK(fixture.rack.call(id, boot_contract::provider_contract, method, empty, &output) == abi::ok);
+        CHECK(output == boot_contract::marker_json);
+        CHECK(fixture.consumer().invoke_provider(output) == abi::ok);
+        CHECK(fixture.rack.shutdown() == abi::ok);
+        CHECK(fixture.runtime().leases.empty());
+        CHECK(fixture.runtime().bindings.empty());
+    }
+    CHECK(failures == allocations);
+    std::printf("boot_test: one-shot call used %ld allocations; %ld injected failures recovered\n",
+                allocations, failures);
 }
 
 } // namespace
@@ -940,6 +1129,7 @@ int main(int argc, char** argv)
     CHECK(!ec);
 
     test_native_parameter_rejections_do_not_throw();
+    test_one_shot_allocation_failures(provider_library);
     test_known_snapshot_oom(provider_library, created_a_library, created_b_library,
                             empty_directory);
     test_new_batch_start_failure(provider_library, batch_directory);

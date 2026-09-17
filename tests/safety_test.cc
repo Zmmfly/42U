@@ -1,21 +1,38 @@
 /**
  * @file safety_test.cc
- * @brief First-pass unload-refusal and isolation safety checks for the 42U host.
+ * @brief Unload-refusal, contract-lease and invoke-only isolation checks for the 42U host.
  *
  * Self-contained: owns its main(), includes only the public <42u/host.hpp> (which pulls
  * <42u/abi.hpp>), inspects no host internals and never probes an expired bare ABI value or a
  * destroyed context "to see whether it still works".
  *
+ * Migrated to ABI v2 (contract lease + invoke-only): a provider discloses one plugin-wide
+ * business contract and a method set, and a consumer holds only a credential-bearing lease,
+ * binds a method with that credential and reaches the provider exclusively through the host
+ * gateway. No provider pointer crosses the plugin boundary any more, so the old "borrow an
+ * idiag and call it through the lease" shape becomes "lease a contract, bind with the
+ * credential, invoke".
+ *
  * Covered contracts:
- *  - an unreturned consumer borrow pins the provider: unload() fails with busy, stop()/destroy()
+ *  - an unreturned consumer lease pins the provider: unload() fails with busy, stop()/destroy()
  *    stay at zero, both identities stay registered, and a zero or foreign credential is refused
- *    without clearing the correct borrow; an active return then unloads with stop()/destroy() == 1;
+ *    without clearing the correct lease; an active return then unloads with stop()/destroy() == 1
+ *    and the binding that the returned credential authorized reports stale;
+ *  - a valid contract that announces no methods can lease only the provider's lifetime:
+ *    acquire() succeeds, bind_name() reports not_found, and the lifetime lock still blocks unload;
+ *  - incompatible contracts (a different family, a different major, or a required minor above the
+ *    offer) are refused with unsupported and leave no lease behind;
+ *  - the native administration path takes an explicit contract: protocol() discovers the current
+ *    offer, the one-shot call() acquires/binds/invokes/returns synchronously, bind() needs a
+ *    credential from acquire(), and a returned credential leaves release and its bindings stale;
  *  - a provider whose stop() returns failed is quarantined: unload never destroys it, a second
  *    unload never retries stop(), and ~host() leaves the pinned graph alive. That graph is
  *    retained on purpose, so the case runs in a forked child leaving through std::_Exit while the
  *    parent checks waitpid strictly; without fork the case prints an explicit skip;
- *  - a credential of an older generation never matches the reloaded instance and never disturbs
- *    the new, live borrow;
+ *  - a consumer whose stop() returns failed keeps its outgoing lease, so its provider is never
+ *    destroyed either (also checked in a forked child that leaves through std::_Exit);
+ *  - a lease of an older generation never matches the reloaded instance - even when the reloaded
+ *    provider offers the same contract id - and never disturbs the new, live lease;
  *  - the local CHECK stays fatal although this file defines NDEBUG, proven by a forked child
  *    whose expected exit status is a failure.
  *
@@ -47,7 +64,7 @@
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
 
 /* ------------------------------------------------------------------ *
  * Harness: NDEBUG-proof CHECK and a self-contained main.
@@ -139,6 +156,65 @@ struct registrar {
     void name()
 
 /* ------------------------------------------------------------------ *
+ * Protocol constants: the business family every fake provider discloses.
+ * ------------------------------------------------------------------ */
+
+/** @brief High/low identity of this suite's family; never zero, so the contract is usable. */
+inline constexpr abi::iid k_protocol_id{0x3432555f53414645ULL, 0x1ULL};
+/** @brief The one valid contract the provider fakes disclose. */
+inline constexpr abi::contract k_protocol{k_protocol_id, 1u, 0u};
+/** @brief A different family used to prove a cross-family lease is refused. */
+inline constexpr abi::iid k_other_id{0x3432555f4f544845ULL, 0x1ULL};
+
+/**
+ * @brief Minimal host-owned output sink required by icalls::call().
+ *
+ * @note The ABI never hands a std::string across the boundary: the plugin writes into this
+ *       borrowed writer and the string stays on the control side. A failed write is sticky so a
+ *       partial result is never mistaken for a complete one.
+ */
+struct sink_writer final : abi::iwriter {
+    std::string value;
+    abi::status U42_CALL write(abi::bytes data) noexcept override
+    {
+        if (result_ != abi::ok) return result_;
+        if (data.size != 0 && data.data == nullptr) return result_ = abi::invalid_argument;
+        if (data.size == 0) return abi::ok;
+        try {
+            value.append(static_cast<const char*>(data.data), static_cast<std::size_t>(data.size));
+        } catch (...) {
+            return result_ = abi::failed;
+        }
+        return abi::ok;
+    }
+
+private:
+    abi::status result_ = abi::ok;
+};
+
+/**
+ * @brief Stable administration-side revocation receiver for the native host path.
+ *
+ * @note The registered address must stay valid until the lease is returned, so it is a named
+ *       local in the case and never a temporary. It returns the credential it recognizes so a
+ *       provider unload can complete.
+ */
+struct host_revoker final : abi::irevoker {
+    u42::host* host = nullptr;
+    [[maybe_unused]] std::uint64_t calls = 0;
+    explicit host_revoker(u42::host* value) noexcept : host(value) {}
+    void U42_CALL on_revoke(abi::token credential) noexcept override
+    {
+        ++calls;
+        if (host == nullptr) return;
+        try {
+            (void)host->release(credential);
+        } catch (...) {
+        }
+    }
+};
+
+/* ------------------------------------------------------------------ *
  * In-process fakes; the factories always outlive the host under test.
  * ------------------------------------------------------------------ */
 
@@ -162,8 +238,14 @@ struct fake_revoker final : abi::irevoker {
     void U42_CALL on_revoke(abi::token credential) noexcept override;
 };
 
-/** @brief Fake instance: idiag provider and borrow-holding consumer in one type. */
-class fake_plug final : public abi::iplug, public abi::idiag {
+/**
+ * @brief Fake instance: business provider (iplug + iinvoke) and lease consumer in one type.
+ *
+ * @note As a provider it announces a contract and answers query(invoke_iid) so the host can
+ *       reach iinvoke; as a consumer it leases a contract through its own icaps and binds a
+ *       method through its own icalls, holding nothing but the returned credential.
+ */
+class fake_plug final : public abi::iplug, public abi::iinvoke {
 public:
     fake_plug(const fake_flags& flags, const abi::caps_desc& announced) noexcept
         : flags_(flags), announced_(announced)
@@ -178,6 +260,9 @@ public:
         void* raw = nullptr;
         if (ctx->query(&abi::caps_iid, &raw) != abi::ok || raw == nullptr) return abi::failed;
         caps = static_cast<abi::icaps*>(raw);
+        raw = nullptr;
+        if (ctx->query(&abi::calls_iid, &raw) != abi::ok || raw == nullptr) return abi::failed;
+        calls = static_cast<abi::icalls*>(raw);
         return abi::ok;
     }
     abi::status U42_CALL start() noexcept override
@@ -195,47 +280,82 @@ public:
     {
         if (out == nullptr || type == nullptr) return abi::invalid_argument;
         *out = nullptr;
-        if (*type != abi::diag_iid) return abi::unsupported;
-        last_published = static_cast<abi::idiag*>(this);
-        *out = last_published;
+        // Only the host-private invoke gateway is ever provided; no cross-plugin business iid.
+        if (*type != abi::invoke_iid) return abi::unsupported;
+        *out = static_cast<abi::iinvoke*>(this);
         return abi::ok;
     }
-    void U42_CALL log(const char*) noexcept override { ++log_calls; }
+    abi::status U42_CALL invoke(abi::method_id method, abi::bytes args,
+                                abi::iwriter* result) noexcept override
+    {
+        (void)method;
+        (void)args;
+        (void)result;
+        ++invoke_calls;
+        return abi::ok;
+    }
 
-    /** @brief Borrow idiag from an active provider through this instance's context. */
-    abi::status acquire_from(const char* provider)
+    /** @brief Lease the provider under this suite's contract through this instance's context. */
+    abi::status acquire_from(const char* provider) { return acquire_contract(provider, k_protocol); }
+    /** @brief Lease the provider under an explicit required contract. */
+    abi::status acquire_contract(const char* provider, const abi::contract& required)
     {
         if (caps == nullptr || provider == nullptr) return abi::invalid_state;
         lease_ = abi::borrow{};
-        const abi::status found = caps->acquire(provider, &abi::diag_iid, &receiver, &lease_);
+        binding_ = abi::binding{};
+        const abi::status found = caps->acquire(provider, &required, &receiver, &lease_);
         if (found != abi::ok) {
             lease_ = abi::borrow{};
             return found;
         }
-        cached = static_cast<abi::idiag*>(lease_.ptr);
         return abi::ok;
     }
-    /** @brief Return the cached credential through this instance's own context. */
+    /** @brief Bind the provider's "ping" method with the live lease credential. */
+    abi::status bind_ping()
+    {
+        if (calls == nullptr || !holds_lease()) return abi::invalid_state;
+        return calls->bind_name(lease_.credential, "ping", &binding_);
+    }
+    /** @brief Invoke the binding made by bind_ping() through this instance's icalls. */
+    abi::status call_bound()
+    {
+        if (calls == nullptr) return abi::invalid_state;
+        sink_writer writer;
+        return calls->call(binding_, abi::bytes{nullptr, 0}, &writer);
+    }
+    /** @brief Invoke an arbitrary (possibly stale) binding value. */
+    abi::status call_value(abi::binding value)
+    {
+        if (calls == nullptr) return abi::invalid_state;
+        sink_writer writer;
+        return calls->call(value, abi::bytes{nullptr, 0}, &writer);
+    }
+    /** @brief Unbind an arbitrary (possibly stale) binding value. */
+    abi::status unbind_value(abi::binding value)
+    {
+        if (calls == nullptr) return abi::invalid_state;
+        return calls->unbind(value);
+    }
+    /** @brief Return the held credential through this instance's own icaps. */
     abi::status return_lease()
     {
         if (caps == nullptr || !holds_lease()) return abi::invalid_state;
         last_release = caps->release(lease_.credential);
         if (last_release == abi::ok) {
             lease_ = abi::borrow{};
-            cached = nullptr;
+            binding_ = abi::binding{};
         }
         return last_release;
     }
     bool holds_lease() const noexcept { return lease_.credential.value != 0; }
 
-    std::uint64_t init_calls = 0, start_calls = 0, stop_calls = 0, destroy_calls = 0, log_calls = 0;
+    std::uint64_t init_calls = 0, start_calls = 0, stop_calls = 0, destroy_calls = 0;
+    std::uint64_t invoke_calls = 0;
     abi::ictx* ctx = nullptr;
     abi::icaps* caps = nullptr;
+    abi::icalls* calls = nullptr;
     abi::borrow lease_{};
-    /** Pointer published by query(); a borrow must carry exactly this value. */
-    abi::idiag* last_published = nullptr;
-    /** Borrowed interface, cleared when its credential is returned and never used afterwards. */
-    abi::idiag* cached = nullptr;
+    abi::binding binding_{};
     abi::status last_release = abi::failed;
     fake_revoker receiver{this};
 
@@ -255,16 +375,27 @@ void U42_CALL fake_revoker::on_revoke(abi::token credential) noexcept
     owner->last_release = owner->caps->release(credential);
     if (owner->last_release == abi::ok) {
         owner->lease_ = abi::borrow{};
-        owner->cached = nullptr;
+        owner->binding_ = abi::binding{};
     }
 }
 
 /** @brief Library-owned fake factory with stable descriptor storage. */
 class fake_factory final : public abi::iplug_fty {
 public:
-    /** @brief Build one type; @p after lists identities that must start before this plugin. */
-    explicit fake_factory(std::string plug_id, std::vector<std::string> after = {})
-        : plug_id_(std::move(plug_id)), after_(std::move(after))
+    /**
+     * @brief Build one type.
+     *
+     * @param plug_id Stable identity; the descriptor borrows this storage.
+     * @param after Identities that must start before this plugin.
+     * @param with_method When true the instance announces the "ping" method as well as its
+     *                    contract, so it can serve business calls; otherwise it discloses a
+     *                    valid contract with an empty method set (a pure lifetime-lock provider).
+     * @param protocol Contract the instance discloses during start().
+     */
+    fake_factory(std::string plug_id, std::vector<std::string> after = {}, bool with_method = false,
+                 abi::contract protocol = k_protocol)
+        : plug_id_(std::move(plug_id)), after_(std::move(after)), with_method_(with_method),
+          protocol_(protocol)
     {
         for (const std::string& value : after_) after_ptrs_.push_back(value.c_str());
         desc_.struct_size = sizeof(abi::plug_desc);
@@ -272,10 +403,15 @@ public:
         desc_.version = "1.0";
         desc_.after_count = static_cast<std::uint32_t>(after_ptrs_.size());
         desc_.after = after_ptrs_.empty() ? nullptr : after_ptrs_.data();
-        interfaces_.push_back(abi::diag_iid);
+        method_desc_.id = 1;
+        method_desc_.name = "ping";
+        method_desc_.description = "safety probe";
+        method_desc_.input_schema = "{}";
+        method_desc_.output_schema = "{}";
         caps_.struct_size = sizeof(abi::caps_desc);
-        caps_.interface_count = 1;
-        caps_.interfaces = interfaces_.data();
+        caps_.method_count = with_method_ ? 1u : 0u;
+        caps_.methods = with_method_ ? &method_desc_ : nullptr;
+        caps_.protocol = protocol_;
     }
 
     abi::status U42_CALL describe(const abi::plug_desc** out) noexcept override
@@ -304,8 +440,10 @@ private:
     std::string plug_id_;
     std::vector<std::string> after_;
     std::vector<const char*> after_ptrs_;
+    bool with_method_ = false;
+    abi::contract protocol_{};
     abi::plug_desc desc_{};
-    std::vector<abi::iid> interfaces_;
+    abi::method_desc method_desc_{};
     abi::caps_desc caps_{};
     std::unique_ptr<fake_plug> instance_;
 };
@@ -321,15 +459,16 @@ bool has_plugin(const u42::host& rack, const char* plug_id)
  * ------------------------------------------------------------------ */
 
 /**
- * @brief An unreturned borrow pins the provider; an active return releases the pin.
+ * @brief An unreturned consumer lease pins the provider; an active return releases the pin.
  *
- * Stays in the ordinary process (credential returned, both instances destroyed), so this case
- * must also pass under ASan/LSan.
+ * The lease is exercised the v2 way: bind a method with the credential and invoke through
+ * icalls, so the "live borrow works" proof is a real provider invoke rather than a pointer call.
+ * The credential is returned in the ordinary process, so this case must also pass under LSan.
  */
 TEST_CASE(unreturned_borrow_pins_the_provider_until_the_return)
 {
     u42::host rack;
-    fake_factory provider("safety1.provider");
+    fake_factory provider("safety1.provider", {}, true);
     fake_factory consumer("safety1.consumer", {"safety1.provider"});
     CHECK_STATUS(rack.add(&provider), abi::ok);
     CHECK_STATUS(rack.add(&consumer), abi::ok);
@@ -338,10 +477,11 @@ TEST_CASE(unreturned_borrow_pins_the_provider_until_the_return)
     fake_plug* borrower = consumer.instance();
     CHECK_STATUS(borrower->acquire_from("safety1.provider"), abi::ok);
     CHECK(borrower->holds_lease());
-    CHECK(borrower->cached == provider.instance()->last_published);
-    borrower->cached->log("live"); // Used only while its credential is live.
-    CHECK(provider.instance()->log_calls == 1);
+    CHECK_STATUS(borrower->bind_ping(), abi::ok);
+    CHECK_STATUS(borrower->call_bound(), abi::ok);          // The only business path is invoke.
+    CHECK(provider.instance()->invoke_calls == 1);            // It really reached the provider.
     const abi::token held = borrower->lease_.credential;
+    const abi::binding bound = borrower->binding_;
 
     consumer.flags.swallow_revocation = true; // on_revoke deliberately keeps the credential.
     CHECK_STATUS(rack.unload("safety1.provider"), abi::busy);
@@ -352,7 +492,7 @@ TEST_CASE(unreturned_borrow_pins_the_provider_until_the_return)
     CHECK(has_plugin(rack, "safety1.provider"));
     CHECK(has_plugin(rack, "safety1.consumer"));
 
-    // A zero credential and another context's credential must not clear the correct borrow.
+    // A zero credential and another context's credential must not clear the correct lease.
     CHECK_STATUS(borrower->caps->release(abi::token{0}), abi::invalid_argument);
     CHECK_STATUS(provider.instance()->caps->release(held), abi::invalid_argument);
     CHECK(borrower->lease_.credential.value == held.value);
@@ -363,7 +503,9 @@ TEST_CASE(unreturned_borrow_pins_the_provider_until_the_return)
     // The control thread returns the credential: the pin is released.
     CHECK_STATUS(borrower->return_lease(), abi::ok);
     CHECK(!borrower->holds_lease());
-    CHECK(borrower->cached == nullptr);
+    // Returning the credential erased the bindings that named it, so they report stale, not ok.
+    CHECK_STATUS(borrower->call_value(bound), abi::stale);
+    CHECK_STATUS(borrower->unbind_value(bound), abi::stale);
     CHECK_STATUS(rack.unload("safety1.provider"), abi::ok);
     CHECK(provider.instance()->stop_calls == 1);
     CHECK(provider.instance()->destroy_calls == 1);
@@ -376,43 +518,102 @@ TEST_CASE(unreturned_borrow_pins_the_provider_until_the_return)
     CHECK(consumer.instance()->destroy_calls == 1);
 }
 
-/** @brief A credential of the previous generation must not touch the reloaded instance. */
-TEST_CASE(old_credential_does_not_match_the_new_instance)
+/**
+ * @brief A valid contract with no methods leases only the lifetime; no method can be bound.
+ */
+TEST_CASE(valid_contract_without_methods_leases_only_the_lifetime)
 {
     u42::host rack;
-    fake_factory provider("safety3.provider");
-    fake_factory consumer("safety3.consumer", {"safety3.provider"});
+    fake_factory provider("safety4.provider", {}, false); // Valid contract, empty method set.
+    fake_factory consumer("safety4.consumer", {"safety4.provider"});
     CHECK_STATUS(rack.add(&provider), abi::ok);
     CHECK_STATUS(rack.add(&consumer), abi::ok);
     CHECK_STATUS(rack.start(), abi::ok);
 
     fake_plug* borrower = consumer.instance();
-    CHECK_STATUS(borrower->acquire_from("safety3.provider"), abi::ok);
-    const abi::token first = borrower->lease_.credential;
-    CHECK(first.value != 0);
-    // The consumer returns normally during revocation, so the first unload can complete.
-    CHECK_STATUS(rack.unload("safety3.provider"), abi::ok);
-    CHECK(provider.instance()->destroy_calls == 1);
-
-    // Reload the same identity: new instance, new generation, and a deliberately kept borrow.
+    // A valid contract is leaseable even with no methods; the lease pins the lifetime only.
+    CHECK_STATUS(borrower->acquire_from("safety4.provider"), abi::ok);
+    CHECK(borrower->holds_lease());
+    CHECK_STATUS(borrower->bind_ping(), abi::not_found); // Nothing was announced to bind.
+    // Keep the credential across the revocation attempt so the lifetime lock is the only pin.
     consumer.flags.swallow_revocation = true;
-    CHECK_STATUS(rack.add(&provider), abi::ok);
-    CHECK_STATUS(rack.start(), abi::ok);
-    CHECK_STATUS(borrower->acquire_from("safety3.provider"), abi::ok);
-    const abi::token second = borrower->lease_.credential;
-    CHECK(second.value != first.value);
-
-    CHECK_STATUS(borrower->caps->release(first), abi::stale); // Old credential, new instance.
-    CHECK(borrower->lease_.credential.value == second.value); // Correct borrow untouched.
-    CHECK_STATUS(rack.unload("safety3.provider"), abi::busy);
+    CHECK_STATUS(rack.unload("safety4.provider"), abi::busy);
     CHECK(provider.instance()->stop_calls == 0);
     CHECK(provider.instance()->destroy_calls == 0);
 
     CHECK_STATUS(borrower->return_lease(), abi::ok);
-    CHECK_STATUS(rack.unload("safety3.provider"), abi::ok);
+    CHECK_STATUS(rack.unload("safety4.provider"), abi::ok);
     CHECK(provider.instance()->stop_calls == 1);
+    CHECK_STATUS(rack.shutdown(), abi::ok);
+}
+
+/**
+ * @brief An incompatible contract is refused and leaves no lease that could pin the provider.
+ */
+TEST_CASE(incompatible_contracts_leave_no_lease_behind)
+{
+    u42::host rack;
+    fake_factory provider("safety5.provider", {}, false);
+    fake_factory consumer("safety5.consumer", {"safety5.provider"});
+    CHECK_STATUS(rack.add(&provider), abi::ok);
+    CHECK_STATUS(rack.add(&consumer), abi::ok);
+    CHECK_STATUS(rack.start(), abi::ok);
+    fake_plug* borrower = consumer.instance();
+
+    const abi::contract other_family{k_other_id, 1u, 0u};
+    CHECK_STATUS(borrower->acquire_contract("safety5.provider", other_family), abi::unsupported);
+    const abi::contract other_major{k_protocol_id, 2u, 0u};
+    CHECK_STATUS(borrower->acquire_contract("safety5.provider", other_major), abi::unsupported);
+    const abi::contract higher_minor{k_protocol_id, 1u, 1u}; // Required minor above offered 0.
+    CHECK_STATUS(borrower->acquire_contract("safety5.provider", higher_minor), abi::unsupported);
+    CHECK(!borrower->holds_lease());
+
+    // No refusal leaked a lease: the provider is still unloadable without any return.
+    CHECK_STATUS(rack.unload("safety5.provider"), abi::ok);
     CHECK(provider.instance()->destroy_calls == 1);
     CHECK_STATUS(rack.shutdown(), abi::ok);
+}
+
+/**
+ * @brief The native administration path takes an explicit contract and leaves no stale ok.
+ */
+TEST_CASE(native_host_calls_require_an_explicit_contract)
+{
+    u42::host rack;
+    fake_factory provider("safety8.provider", {}, true);
+    CHECK_STATUS(rack.add(&provider), abi::ok);
+    CHECK_STATUS(rack.start(), abi::ok);
+
+    // Discovery reports the current offer without acquiring a lease or calling the plugin.
+    abi::contract discovered{};
+    CHECK_STATUS(rack.protocol("safety8.provider", &discovered), abi::ok);
+    CHECK(discovered.id == k_protocol_id && discovered.major == 1u);
+    CHECK_STATUS(rack.protocol("safety8.absent", &discovered), abi::not_found);
+    CHECK(discovered.id == abi::iid{}); // Cleared on failure.
+    CHECK(provider.instance()->invoke_calls == 0);
+
+    // The one-shot call acquires, binds, invokes and returns synchronously under the contract.
+    std::string output;
+    CHECK_STATUS(rack.call("safety8.provider", k_protocol, "ping", abi::bytes{nullptr, 0}, &output),
+                 abi::ok);
+    CHECK(provider.instance()->invoke_calls == 1);
+
+    // An incompatible contract is refused before any invocation.
+    const abi::contract other{k_other_id, 1u, 0u};
+    CHECK_STATUS(rack.call("safety8.provider", other, "ping", abi::bytes{nullptr, 0}, &output),
+                 abi::unsupported);
+    CHECK(provider.instance()->invoke_calls == 1);
+
+    // bind() never accepts an unowned credential, and a returned lease stays returned.
+    host_revoker revoker(&rack);
+    abi::borrow lease{};
+    CHECK_STATUS(rack.bind(abi::token{0}, "ping", nullptr), abi::invalid_argument);
+    CHECK_STATUS(rack.acquire("safety8.provider", k_protocol, &revoker, &lease), abi::ok);
+    CHECK_STATUS(rack.release(lease.credential), abi::ok);
+    CHECK_STATUS(rack.release(lease.credential), abi::stale);
+
+    CHECK_STATUS(rack.shutdown(), abi::ok);
+    CHECK(provider.instance()->destroy_calls == 1);
 }
 
 #if U42_SAFETY_FORK
@@ -500,6 +701,39 @@ void quarantined_failed_stop_body()
     CHECK(provider.instance()->destroy_calls == 0);
 }
 
+/**
+ * @brief A failed consumer stop keeps its outgoing lease, which keeps the provider pinned.
+ *
+ * The consumer's own stop() returns failed while it still holds an outgoing lease on the
+ * provider. The unload is refused, the lease - and therefore the provider's outgoing borrow -
+ * survives, and the retained graph is only released by std::_Exit.
+ */
+void failed_consumer_stop_body()
+{
+    fake_factory provider("safety7.provider");
+    fake_factory consumer("safety7.consumer", {"safety7.provider"});
+    consumer.flags.stop_status = abi::failed;
+    {
+        u42::host rack;
+        CHECK_STATUS(rack.add(&provider), abi::ok);
+        CHECK_STATUS(rack.add(&consumer), abi::ok);
+        CHECK_STATUS(rack.start(), abi::ok);
+        fake_plug* borrower = consumer.instance();
+        CHECK_STATUS(borrower->acquire_from("safety7.provider"), abi::ok);
+        CHECK(borrower->holds_lease());
+
+        CHECK_FAILS(rack.unload("safety7.consumer")); // stop() failed: the consumer is retained.
+        CHECK(consumer.instance()->stop_calls == 1);
+        CHECK(consumer.instance()->destroy_calls == 0);
+        CHECK(borrower->holds_lease()); // Its outgoing borrow was not cleared.
+        CHECK(provider.instance()->stop_calls == 0);
+        CHECK(provider.instance()->destroy_calls == 0);
+
+        // Leaving this scope runs ~host(); the retained graph must not be reported as a leak, so
+        // the child leaves through std::_Exit instead of the normal exit path.
+    }
+}
+
 /** @brief Child body that must fail: it proves CHECK is still fatal under NDEBUG. */
 void ndebug_probe_body()
 {
@@ -525,6 +759,69 @@ TEST_CASE(failed_stop_is_quarantined_even_at_host_destruction)
                  g_case);
     std::fflush(stderr);
 #endif
+}
+
+/**
+ * @brief A consumer whose stop() failed keeps its outgoing lease, so its provider is pinned.
+ */
+TEST_CASE(failed_consumer_stop_retains_its_outgoing_lease)
+{
+#if U42_SAFETY_FORK
+    run_in_child("child:failed_consumer_stop_retains_its_outgoing_lease", &failed_consumer_stop_body,
+                 true);
+#else
+    std::fprintf(stderr,
+                 "[skip] %s: no fork/waitpid on this platform; the failed-consumer-stop case "
+                 "was NOT executed\n",
+                 g_case);
+    std::fflush(stderr);
+#endif
+}
+
+/** @brief A lease of the previous generation must not touch the reloaded instance. */
+TEST_CASE(old_credential_does_not_match_the_new_instance)
+{
+    u42::host rack;
+    fake_factory provider("safety3.provider", {}, true);
+    fake_factory consumer("safety3.consumer", {"safety3.provider"});
+    CHECK_STATUS(rack.add(&provider), abi::ok);
+    CHECK_STATUS(rack.add(&consumer), abi::ok);
+    CHECK_STATUS(rack.start(), abi::ok);
+
+    fake_plug* borrower = consumer.instance();
+    CHECK_STATUS(borrower->acquire_from("safety3.provider"), abi::ok);
+    CHECK_STATUS(borrower->bind_ping(), abi::ok);
+    const abi::token first = borrower->lease_.credential;
+    const abi::binding first_binding = borrower->binding_;
+    CHECK(first.value != 0);
+    CHECK_STATUS(borrower->call_bound(), abi::ok);
+    CHECK(provider.instance()->invoke_calls == 1);
+    // The consumer returns normally during revocation, so the first unload can complete.
+    CHECK_STATUS(rack.unload("safety3.provider"), abi::ok);
+    CHECK(provider.instance()->destroy_calls == 1);
+    // That unload returned the lease and erased its binding: the old binding is stale.
+    CHECK_STATUS(borrower->call_value(first_binding), abi::stale);
+
+    // Reload the same identity with the same contract: new generation, deliberately kept lease.
+    consumer.flags.swallow_revocation = true;
+    CHECK_STATUS(rack.add(&provider), abi::ok);
+    CHECK_STATUS(rack.start(), abi::ok);
+    CHECK_STATUS(borrower->acquire_from("safety3.provider"), abi::ok);
+    CHECK_STATUS(borrower->bind_ping(), abi::ok);
+    const abi::token second = borrower->lease_.credential;
+    CHECK(second.value != first.value);
+
+    CHECK_STATUS(borrower->caps->release(first), abi::stale); // Old credential, new instance.
+    CHECK(borrower->lease_.credential.value == second.value); // Correct lease untouched.
+    CHECK_STATUS(rack.unload("safety3.provider"), abi::busy);
+    CHECK(provider.instance()->stop_calls == 0);
+    CHECK(provider.instance()->destroy_calls == 0);
+
+    CHECK_STATUS(borrower->return_lease(), abi::ok);
+    CHECK_STATUS(rack.unload("safety3.provider"), abi::ok);
+    CHECK(provider.instance()->stop_calls == 1);
+    CHECK(provider.instance()->destroy_calls == 1);
+    CHECK_STATUS(rack.shutdown(), abi::ok);
 }
 
 /**

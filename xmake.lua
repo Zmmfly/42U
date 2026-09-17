@@ -1,5 +1,5 @@
 set_project("42u")
-set_version("0.1.0")
+set_version("0.2.0")
 set_xmakever("2.9.0")
 set_languages("c++17")
 set_warnings("all", "error")
@@ -50,7 +50,7 @@ for _, name in ipairs({"echo", "consumer"}) do
         end
 end
 
-for _, name in ipairs({"bad_abi", "missing_entry"}) do
+for _, name in ipairs({"bad_abi", "missing_entry", "legacy_v1"}) do
     target("fixture_" .. name)
         set_kind("shared")
         set_filename(name .. plugin_suffix)
@@ -93,7 +93,7 @@ target("boot_test")
         }})
     end)
 
-for _, name in ipairs({"order", "sdk", "abi", "runtime", "event", "safety", "reentrant", "withdraw"}) do
+for _, name in ipairs({"order", "sdk", "abi", "runtime", "event", "safety", "reentrant", "withdraw", "contract"}) do
     target(name .. "_test")
         set_kind("binary")
         add_files("tests/" .. name .. "_test.cc")
@@ -105,12 +105,13 @@ target("integration_test")
     set_kind("binary")
     add_files("tests/integration_test.cc")
     add_deps("42u")
-    add_deps("echo", "consumer", "fixture_bad_abi", "fixture_missing_entry", {inherit = false})
+    add_deps("echo", "consumer", "fixture_bad_abi", "fixture_missing_entry", "fixture_legacy_v1", {inherit = false})
     set_rundir("$(projectdir)")
     after_load(function (target)
         target:add("tests", "default", {runargs = {
             path.absolute(target:dep("echo"):targetdir()),
             path.absolute(target:dep("fixture_bad_abi"):targetfile()),
-            path.absolute(target:dep("fixture_missing_entry"):targetfile())
+            path.absolute(target:dep("fixture_missing_entry"):targetfile()),
+            path.absolute(target:dep("fixture_legacy_v1"):targetfile())
         }})
     end)

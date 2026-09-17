@@ -58,7 +58,7 @@ public:
      *                including process-lifetime retention if safe teardown fails.
      * @return ok when staged; busy inside a plugin callback; otherwise the staging error.
      */
-    abi::v1::status add(abi::v1::iplug_fty* factory);
+    abi::v2::status add(abi::v2::iplug_fty* factory);
     /**
      * @brief Scan and eagerly stage every candidate before initialization, then start the batch.
      *
@@ -69,7 +69,7 @@ public:
      *       Startup has the same deferred-unload boundary as start(). Scan/staging failure only
      *       rolls back newly scanned records; cleanup is best effort under allocation failure.
      */
-    abi::v1::status boot(const std::filesystem::path& directory);
+    abi::v2::status boot(const std::filesystem::path& directory);
     /**
      * @brief Initialize all staged plugins before starting any, using a deterministic plan.
      *
@@ -82,7 +82,7 @@ public:
      *       is best effort: allocation failure before planning or during rollback may leave Created
      *       or quarantined records for retry/shutdown; failed is not a strong rollback guarantee.
      */
-    abi::v1::status start();
+    abi::v2::status start();
     /**
      * @brief Hot-load one library; existing after constraints may be satisfied, before may not.
      *
@@ -91,7 +91,7 @@ public:
      * @note Starts all Created instances, using start() semantics. Failed cleanup can leave staged
      *       or quarantined records for later shutdown(); failure is not an unconditional rollback.
      */
-    abi::v1::status load(const std::filesystem::path& path);
+    abi::v2::status load(const std::filesystem::path& path);
     /**
      * @brief Revoke, stop and unload an instance; unreturned leases make this fail safely.
      *
@@ -102,7 +102,7 @@ public:
      *       poll() after it returns provides a safe point. Explicit unload can satisfy a request.
      *       Requests disappear with their instance and never target a later same-ID replacement.
      */
-    abi::v1::status unload(const std::string& plug_id);
+    abi::v2::status unload(const std::string& plug_id);
     /**
      * @brief Withdraw capabilities, request lease returns, then stop in reverse initialization order.
      *
@@ -112,7 +112,7 @@ public:
      *       entry points even if cleanup fails. Failed consumers retain their outgoing borrowings,
      *       potentially retaining their providers too; failed stop() is not automatically retried.
      */
-    abi::v1::status shutdown();
+    abi::v2::status shutdown();
     /**
      * @brief Dispatch queued events/notifications and deferred unloads at a safe point.
      *
@@ -124,66 +124,99 @@ public:
      *       Internal allocation exceptions provide only best-effort queue retention. After failed,
      *       explicitly retry unload(plug_id) rather than assuming the request is still queued.
      */
-    abi::v1::status poll();
+    abi::v2::status poll();
     /**
-     * @brief Bind an active plugin method by name; binding does not retain the provider.
+     * @brief Discover the currently published business protocol without acquiring a lease.
      *
      * @param plug_id Current provider identity.
-     * @param method Exact method name.
-     * @param[out] out Required output, cleared before lookup on the control thread.
-     * @return ok with a host-owned binding; otherwise a lookup/state/argument error.
+     * @param[out] out Required output, cleared first on the control thread.
+     * @return ok for an Active provider with a valid protocol; otherwise a lookup/state error.
+     * @note Discovery is not compatibility acceptance or a lifetime lock. Stateful consumers
+     *       must supply their own expected protocol to acquire(), not blindly copy this result.
      */
-    abi::v1::status bind(const std::string& plug_id, const std::string& method,
-                         abi::v1::binding* out);
+    abi::v2::status protocol(const std::string& plug_id, abi::v2::contract* out);
     /**
-     * @brief Bind an active plugin method by its numeric ID.
+     * @brief Acquire an administration-owned, revocable lease on one compatible provider instance.
      *
      * @param plug_id Current provider identity.
+     * @param required Expected protocol family/major and minimum compatible minor.
+     * @param receiver Required stable revoker, kept alive until successful lease return.
+     * @param[out] out Required output, cleared on the control thread; contains no interface pointer.
+     * @return ok, unsupported for incompatible contracts, or an argument/state/allocation error.
+     * @note The lease pins one generation. Reacquire after reload and reconstruct dependent state.
+     */
+    abi::v2::status acquire(const std::string& plug_id, const abi::v2::contract& required,
+                            abi::v2::irevoker* receiver, abi::v2::borrow* out);
+    /**
+     * @brief Return an administration-owned lease and invalidate all of its method bindings.
+     *
+     * @param credential Nonzero lease credential issued by acquire().
+     * @return ok after return; stale if already gone; busy during a call on this lease;
+     *         otherwise an argument/ownership/thread error, retaining the lease on refusal.
+     */
+    abi::v2::status release(abi::v2::token credential);
+    /**
+     * @brief Bind a named method under a live administration-owned lease.
+     *
+     * @param credential Lease issued by acquire(), fixing the provider instance and protocol.
+     * @param method Exact published method name.
+     * @param[out] out Required output, cleared on the control thread.
+     * @return ok, stale for an expired lease, or an argument/ownership/state/lookup error.
+     */
+    abi::v2::status bind(abi::v2::token credential, const std::string& method,
+                         abi::v2::binding* out);
+    /**
+     * @brief Bind a numeric method under a live administration-owned lease.
+     *
+     * @param credential Lease issued by acquire().
      * @param method Provider-local method ID.
-     * @param[out] out Required output, cleared before lookup on the control thread.
-     * @return ok with a host-owned binding; otherwise a lookup/state/argument error.
+     * @param[out] out Required output, cleared on the control thread.
+     * @return ok, stale for an expired lease, or an argument/ownership/state/lookup error.
      */
-    abi::v1::status bind(const std::string& plug_id, abi::v1::method_id method,
-                         abi::v1::binding* out);
+    abi::v2::status bind(abi::v2::token credential, abi::v2::method_id method,
+                         abi::v2::binding* out);
     /**
-     * @brief Release a host-owned binding; its value must not subsequently be used.
+     * @brief Release a binding without releasing its lease or unlocking the provider.
      *
-     * @param value Nonzero binding issued to this host's administration context.
-     * @return ok if released; stale if unknown or not owned; invalid_argument if zero.
+     * @param value Nonzero administration-owned binding.
+     * @return ok if released; stale if already invalidated; otherwise an argument/ownership error.
      */
-    abi::v1::status unbind(abi::v1::binding value);
+    abi::v2::status unbind(abi::v2::binding value);
     /**
-     * @brief Synchronously invoke a checked binding and atomically return bounded JSON output.
+     * @brief Invoke through the host gateway with lease, owner, generation and state checks.
      *
-     * @param target Nonzero host-owned binding; does not keep its provider alive.
-     * @param args Borrowed input for this call; null data requires zero size.
-     * @param[out] out Required string, cleared before validation on the control thread; must not
-     *                 own storage referenced by args. Failure discards partial output.
-     * @return ok with complete output; otherwise a binding/state/invocation or output-limit error.
+     * @param target Administration-owned binding backed by a still-live lease.
+     * @param args Borrowed input; null data requires zero size; must not refer into *out.
+     * @param[out] out Required string, cleared on the control thread. Partial output is discarded.
+     * @return ok with complete output; stale after lease return/reload; otherwise a call error.
      */
-    abi::v1::status call(abi::v1::binding target, abi::v1::bytes args, std::string* out);
+    abi::v2::status call(abi::v2::binding target, abi::v2::bytes args, std::string* out);
     /**
-     * @brief Convenience name lookup plus invocation, without leaking a temporary binding.
+     * @brief One-shot administration call using an explicit protocol and a temporary lease.
      *
      * @param plug_id Current provider identity; must not alias *out.
+     * @param required Explicitly accepted protocol; never inferred from plugin release version.
      * @param method Exact method name; must not alias *out.
      * @param args Borrowed input; null data requires zero size; must not refer into *out.
-     * @param[out] out Required string, cleared on the control thread before lookup.
-     * @return ok with complete output; otherwise a lookup/invocation/output error.
+     * @param[out] out Required output, cleared before validation on the control thread.
+     * @return ok with complete output; otherwise a compatibility/lookup/invocation/output error.
+     * @note Acquires, binds, calls, unbinds and returns the lease synchronously. This does not
+     *       preserve provider sessions across calls; use an explicit lease for stateful work.
      */
-    abi::v1::status call(const std::string& plug_id, const std::string& method,
-                         abi::v1::bytes args, std::string* out);
+    abi::v2::status call(const std::string& plug_id, const abi::v2::contract& required,
+                         const std::string& method, abi::v2::bytes args, std::string* out);
     /**
-     * @brief Convenience numeric lookup plus invocation.
+     * @brief Numeric form of the explicit-protocol one-shot administration call.
      *
      * @param plug_id Current provider identity; must not alias *out.
+     * @param required Explicitly accepted protocol family/major and minimum compatible minor.
      * @param method Provider-local method ID.
      * @param args Borrowed input; null data requires zero size; must not refer into *out.
-     * @param[out] out Required string, cleared on the control thread before lookup.
-     * @return ok with complete output; otherwise a lookup/invocation/output error.
+     * @param[out] out Required output, cleared before validation on the control thread.
+     * @return ok with complete output; otherwise a compatibility/lookup/invocation/output error.
      */
-    abi::v1::status call(const std::string& plug_id, abi::v1::method_id method,
-                         abi::v1::bytes args, std::string* out);
+    abi::v2::status call(const std::string& plug_id, const abi::v2::contract& required,
+                         abi::v2::method_id method, abi::v2::bytes args, std::string* out);
     /**
      * @brief Current plugin identities, including staged and quarantined instances.
      *

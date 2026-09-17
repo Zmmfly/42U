@@ -10,7 +10,8 @@
  *
  * Build (links the whole library, like the other tests):
  *   g++ -std=c++17 -Wall -Wextra -Werror -Iinc -Isrc src/context.cc src/events.cc src/host.cc \
- *       src/order.cc src/plug.cc tests/withdraw_test.cc -o /tmp/u42-withdraw-test -ldl -pthread
+ *       src/order.cc src/plug.cc tests/withdraw_test.cc -o build/invoke-v2/events/withdraw_test \
+ *       -ldl -pthread
  *
  * @note NDEBUG is defined deliberately so CHECK never collapses into assert().
  * @note The injector is disarmed before every CHECK, and replacement operator new/delete are a
@@ -156,7 +157,11 @@ void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept { s
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
+
+/** @brief Protocol the provider fixture announces: a valid family carried by every notice. */
+constexpr abi::iid provider_protocol_id{0x1234, 0x5678};
+constexpr abi::contract provider_protocol{provider_protocol_id, 1u, 0u};
 using u42::host_options;
 using u42::detail::cap_notice;
 using u42::detail::cap_subscription;
@@ -214,7 +219,7 @@ struct fixture {
      * @param watch_count Number of registered watches that must each receive a notice.
      * @param published Whether the provider currently offers capabilities.
      * @note Every string is longer than the small-string buffer and the capability set holds one
-     *       interface and one method, so each queued notice performs several real allocations
+     *       protocol and one method, so each queued notice performs several real allocations
      *       and the injector has many addressable failure points inside withdraw().
      */
     explicit fixture(std::size_t watch_count, bool published = true) : runtime(host_options{})
@@ -231,7 +236,7 @@ struct fixture {
         method.description = "deterministic allocation probe for withdraw";
         method.input_schema = "{\"type\":\"object\",\"title\":\"probe-input\"}";
         method.output_schema = "{\"type\":\"object\",\"title\":\"probe-output\"}";
-        item->capabilities.interfaces.push_back(abi::iid{0x1234, 0x5678});
+        item->capabilities.protocol = provider_protocol;
         item->capabilities.methods.push_back(std::move(method));
         provider = item.get();
         runtime.records.emplace(id, std::move(item));
@@ -312,7 +317,9 @@ void test_success_and_idempotence()
         CHECK(note.provider == probe.provider->order.plug_id);
         CHECK(note.generation == probe.provider->generation);
         CHECK(!note.available);
-        CHECK(note.capabilities.interfaces.size() == 1);
+        CHECK(note.capabilities.protocol.id == provider_protocol_id);
+        CHECK(note.capabilities.protocol.major == provider_protocol.major);
+        CHECK(abi::valid_contract(note.capabilities.protocol));
         CHECK(note.capabilities.methods.size() == 1);
     }
     const abi::status repeated = probe.runtime.withdraw(*probe.provider);

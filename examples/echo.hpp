@@ -2,13 +2,19 @@
 
 /**
  * @file echo.hpp
- * @brief Shared contract of the example echo provider plugin.
+ * @brief Shared data contract of the two example plugins.
  *
  * @details
- * This header is the only artifact shared by the two example plugins. It depends
- * exclusively on the frozen plugin ABI in <42u/abi.hpp> and intentionally does not
- * include any SDK wrapper header, so each example can be built with a bare compiler
- * command and requires no host implementation.
+ * The example provider and the example consumer share no business class, no interface pointer and
+ * no provider query result. This header therefore declares data only: the protocol each side
+ * publishes or expects, the method numbers of those protocols, and nothing else. Business traffic
+ * travels through the host gateway, so the provider's C++ type never has to cross the
+ * translation-unit boundary: the consumer holds a pointerless lease credential, binds a method
+ * with that credential and invokes the provider through icalls.
+ *
+ * @note The header depends exclusively on the frozen plugin ABI in <42u/abi.hpp> and includes no
+ *       SDK wrapper, so an example can be built with a bare compiler command and requires no host
+ *       implementation to compile or link.
  */
 
 #include <42u/abi.hpp>
@@ -16,46 +22,48 @@
 /**
  * @brief Short alias for the frozen ABI namespace.
  *
- * @note Redeclaring the same alias for the same namespace is harmless, so this
- *       definition coexists with an SDK-provided alias of the same name.
+ * @note Redeclaring the same alias for the same namespace is harmless, so this definition
+ *       coexists with any alias of the same name provided elsewhere.
  */
-namespace a = u42::abi::v1;
+namespace a = u42::abi::v2;
 
 namespace example {
 
 /**
- * @brief Identity of the echo provider interface contract.
+ * @brief Business protocol published by the echo provider.
  *
- * @note The value is frozen forever. It identifies the immutable interface
- *       contract, not any particular provider instance.
+ * @details
+ * The identifier high half spells "echo42U2"; major 1 is the first published contract and minor 0
+ * promises no revision older than itself. The provider repeats exactly this contract in its
+ * capability announcement, and a consumer must accept an offer only through
+ * compatible_contract(offered, echo_contract); the plugin release version is never consulted.
+ *
+ * Methods, all synchronous with a JSON argument document and a JSON result document:
+ * - 1 "echo": copy the request bytes through the caller's writer unchanged.
+ * - 2 "fail": copy a partial JSON prefix and then report failure, so a host can observe that
+ *   partial output is discarded atomically.
  */
-constexpr a::iid echo_iid{0x6563686f34325531ULL, 1};
+constexpr a::contract echo_contract{{0x6563686f34325532ULL, 1}, 1, 0};
 
 /**
- * @brief Synchronous echo interface published by the example provider.
+ * @brief Business protocol published by the consumer.
  *
- * @note An implementation is borrowed through icaps::acquire and stays usable
- *       only while the host borrowing credential is held. A consumer must clear
- *       its cached pointer and return the credential in irevoker::on_revoke.
+ * @details
+ * The identifier high half spells "cons42U2". The consumer discloses only its own optional status
+ * method and never acquires this contract itself.
+ *
+ * Methods, all synchronous with a JSON argument document and a JSON result document:
+ * - 1 "status": report {"connected":bool,"revocations":n,"events":n} for the current instance.
  */
-struct iecho {
-    /**
-     * @brief Return the caller-supplied JSON payload unchanged.
-     *
-     * @param input Borrowed request bytes; a null data pointer is accepted only
-     *              together with a zero size.
-     * @param out Caller-owned output writer; never retained after the call.
-     * @retval ok The whole payload was accepted by the writer.
-     * @retval invalid_argument A required argument was null or inconsistent.
-     * @retval failed The writer rejected the write or threw across the ABI.
-     *
-     * @note The provider neither parses nor retains the payload; it only copies
-     *       the bytes through the writer, which preserves them exactly.
-     */
-    virtual a::status U42_CALL echo(a::bytes input, a::iwriter* out) noexcept = 0;
+constexpr a::contract consumer_contract{{0x636f6e7334325532ULL, 1}, 1, 0};
 
-protected:
-    ~iecho() = default;
-};
+/// @brief Method number of the provider's verbatim copy method.
+constexpr a::method_id echo_method_id = 1;
+
+/// @brief Method number of the provider's deliberate partial-then-fail method.
+constexpr a::method_id fail_method_id = 2;
+
+/// @brief Method number of the consumer's status method.
+constexpr a::method_id status_method_id = 1;
 
 } // namespace example

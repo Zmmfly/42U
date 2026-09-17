@@ -4,13 +4,13 @@
  *
  * This translation unit owns every host service reachable through one plugin context
  * except the event queue itself: interface lookup, capability announcement, capability
- * watching, tracked interface borrowing, dynamic method binding and invocation, plus the
- * engine transitions that publish, withdraw, revoke and clean up what those services
- * recorded. Event subscription, publishing and engine::drain belong to src/events.cc;
- * lifecycle orchestration belongs to src/host.cc.
+ * watching, contract leasing, lease-bound method binding and invocation, plus the engine
+ * transitions that publish, withdraw, revoke and clean up what those services recorded.
+ * Event subscription, publishing and engine::drain belong to src/events.cc; lifecycle
+ * orchestration belongs to src/host.cc.
  *
  * Contract implemented here:
- * - Every ABI entry point is noexcept and maps any escaping exception to abi::v1::failed.
+ * - Every ABI entry point is noexcept and maps any escaping exception to abi::v2::failed.
  * - Required outputs are cleared before any other validation; mutating entry points
  *   validate the control thread before reading or writing any other shared state. The
  *   control-thread identity is immutable after engine construction, so reading it off
@@ -26,6 +26,17 @@
  *   pointer to an owner that may have been removed.
  * - Tokens are drawn from one monotonic counter, are never reused and never wrap into a
  *   valid value, so a stale credential can never match a later record.
+ * - One plugin instance discloses one plugin-wide business contract plus its method set. A
+ *   non-empty method set must disclose a valid contract; an all-zero contract is legal only
+ *   for an empty method set, which can be leased for its lifetime but never called.
+ * - No business pointer crosses a plugin boundary. acquire() records a logical lock only: it
+ *   validates the disclosed contract against the caller's requirement and never calls
+ *   iplug::query. Every binding must name a live lease credential, and every call reaches
+ *   the provider through the host-owned iinvoke that query(invoke_iid) returned when the
+ *   instance published.
+ * - A map reference is never kept across a plugin callback: leases, bindings and notices
+ *   are re-resolved by token after any call that could have erased them. A lease's in-flight
+ *   counter covers both the invoke and the delivery of its result.
  */
 #include "internal.hpp"
 
@@ -67,7 +78,7 @@ bool bounded_length(const char* text, std::size_t limit, std::size_t& size) noex
  *
  * @param text Optional NUL-terminated UTF-8 string; null is copied as empty.
  * @param[out] out Host-owned copy, replaced in place.
- * @return abi::v1::ok, invalid_argument, or limit_exceeded for oversized text.
+ * @return abi::v2::ok, invalid_argument, or limit_exceeded for oversized text.
  * @note A failure may leave out partially replaced; callers discard it on failure.
  */
 a::status copy_text(const char* text, std::string& out)
@@ -87,7 +98,7 @@ a::status copy_text(const char* text, std::string& out)
  *
  * @param text Required NUL-terminated string such as a plug_id or method name.
  * @param[out] size Receives the byte length on success.
- * @return abi::v1::ok, invalid_argument for null/empty text, or limit_exceeded.
+ * @return abi::v2::ok, invalid_argument for null/empty text, or limit_exceeded.
  */
 a::status check_key(const char* text, std::size_t& size) noexcept
 {
@@ -148,7 +159,7 @@ bool record_is_live(const engine& runtime, const record* value) noexcept
  * @brief Validate that the calling context may take on new work.
  *
  * @param self Calling context (plugin instance or host administration).
- * @return abi::v1::ok when a borrow or binding may start, otherwise invalid_state.
+ * @return abi::v2::ok when a lease or binding may start, otherwise invalid_state.
  * @note Called after the control-thread check and never off thread.
  */
 a::status check_new_work(context& self)
@@ -158,17 +169,17 @@ a::status check_new_work(context& self)
         return runtime.fail(a::invalid_state, "new work is not allowed while the host is shutting down");
     if (self.owner && self.owner->state != phase::initialized && self.owner->state != phase::active)
         return runtime.fail(a::invalid_state,
-                           "only an initialized or active instance may acquire interfaces or bind methods");
+                           "only an initialized or active instance may lease contracts or bind methods");
     return a::ok;
 }
 
 /**
- * @brief Resolve and validate the provider of a new borrow or binding.
+ * @brief Resolve and validate the provider of a new lease or binding.
  *
  * @param runtime Engine owning the records.
  * @param plug_id Required provider identity.
  * @param[out] provider Receives the live, active, published provider record.
- * @return abi::v1::ok, invalid_argument/limit_exceeded for the identity, not_found when the
+ * @return abi::v2::ok, invalid_argument/limit_exceeded for the identity, not_found when the
  *         identity is unknown or its capabilities are not published, or invalid_state when
  *         the instance is not active.
  */
@@ -192,17 +203,109 @@ a::status resolve_active_provider(engine& runtime, const char* plug_id, record*&
 }
 
 /**
+ * @brief Validate that a leased provider still denotes the generation the lease pinned.
+ *
+ * @param runtime Engine owning the records.
+ * @param provider Provider record recorded by the lease; compared before it is dereferenced.
+ * @param generation Provider generation recorded by the lease.
+ * @param[out] checked Receives the live provider record on success; untouched on failure.
+ * @return abi::v2::ok, stale when the instance is gone or its generation moved on, not_found
+ *         when it withdrew its capabilities, or invalid_state when it cannot serve calls.
+ * @note A lease keeps a record pointer for identity comparison only: the pointer is checked
+ *       against the live registry before any field is read, so a lease that outlived its
+ *       provider is refused without touching freed memory.
+ */
+a::status check_leased_provider(engine& runtime, record* provider, std::uint64_t generation,
+                                record*& checked)
+{
+    if (!record_is_live(runtime, provider))
+        return runtime.fail(a::stale, "the provider instance is gone; the lease must be re-acquired");
+    if (provider->generation != generation)
+        return runtime.fail(a::stale, "the provider was reloaded; the lease must be re-acquired");
+    if (!provider->published)
+        return runtime.fail(a::not_found, "the provider has withdrawn its capabilities");
+    if (provider->state != phase::active)
+        return runtime.fail(a::invalid_state, "the provider is not active");
+    if (!provider->instance)
+        return runtime.fail(a::invalid_state, "the provider has no live instance");
+    checked = provider;
+    return a::ok;
+}
+
+/**
+ * @brief Reserve one in-flight call slot on a lease, resolved freshly by its credential.
+ *
+ * @param runtime Engine owning the lease table.
+ * @param credential Lease credential copied out of the binding before any plugin code ran.
+ * @return abi::v2::ok after the counter was raised, or stale when the lease is gone.
+ */
+a::status begin_active_call(engine& runtime, std::uint64_t credential)
+{
+    const auto found = runtime.leases.find(credential);
+    if (found == runtime.leases.end())
+        return runtime.fail(a::stale,
+                            "the lease behind this binding is gone; the binding must be recreated");
+    ++found->second.active_calls;
+    return a::ok;
+}
+
+/**
+ * @brief Balance a lease's in-flight counter after the call it covers has finished.
+ *
+ * @note The counter is released through a fresh credential lookup rather than a retained
+ *       iterator, so nothing here can reference an entry that a nested operation erased. The
+ *       destructor neither allocates nor throws.
+ */
+struct active_call_guard {
+    engine& runtime;
+    std::uint64_t credential;
+    bool armed = false;
+    active_call_guard(engine& e, std::uint64_t value) noexcept : runtime(e), credential(value) {}
+    ~active_call_guard()
+    {
+        if (!armed) return;
+        const auto found = runtime.leases.find(credential);
+        if (found != runtime.leases.end() && found->second.active_calls != 0) --found->second.active_calls;
+    }
+    /** @brief Start balancing on destruction; called once the counter was successfully taken. */
+    void arm() noexcept { armed = true; }
+    active_call_guard(const active_call_guard&) = delete;
+    active_call_guard& operator=(const active_call_guard&) = delete;
+};
+
+/**
+ * @brief Raise the engine call depth around a host-owned callback that has no plugin record.
+ *
+ * @note The administration context holds no record to nest under, so it cannot use
+ *       call_scope. Raising engine::depth directly still marks a callback as on the stack,
+ *       which makes the structural host operations (start, load, unload, shutdown) refuse to
+ *       run while a revoker is observing the lease table.
+ */
+struct runtime_depth_scope {
+    engine& runtime;
+    explicit runtime_depth_scope(engine& value) noexcept : runtime(value) { ++runtime.depth; }
+    ~runtime_depth_scope() { --runtime.depth; }
+    runtime_depth_scope(const runtime_depth_scope&) = delete;
+    runtime_depth_scope& operator=(const runtime_depth_scope&) = delete;
+};
+
+/**
  * @brief Store one generation-checked binding for the calling context.
  *
  * @param self Calling context that will own the binding.
- * @param provider Resolved active provider.
- * @param method Announced method being bound.
+ * @param provider Live provider record the lease pinned.
+ * @param generation Provider generation recorded by the lease.
+ * @param method Announced method id resolved from that provider.
+ * @param credential Lease credential that authorizes this binding.
  * @param[out] out Receives the opaque binding value on success.
- * @return abi::v1::ok, limit_exceeded when no token remains, or failed on allocation failure.
- * @note The binding keeps the provider identity and generation, never a provider pointer, so
- *       it cannot keep an instance alive and cannot silently follow a reload.
+ * @return abi::v2::ok, limit_exceeded when no token remains, or failed on allocation failure.
+ * @note The binding keeps the provider identity, its generation and the authorizing
+ *       credential, never a provider pointer, so it cannot keep an instance alive and cannot
+ *       silently follow a reload. Every field is copied out of the provider before the entry
+ *       is stored, so no reference into the capability set is retained.
  */
-a::status store_binding(context& self, record& provider, const owned_method& method, a::binding* out)
+a::status store_binding(context& self, record& provider, std::uint64_t generation, a::method_id method,
+                        a::token credential, a::binding* out)
 {
     engine& runtime = self.runtime;
     const std::uint64_t slot = take_token(runtime);
@@ -211,8 +314,9 @@ a::status store_binding(context& self, record& provider, const owned_method& met
         bound_method entry;
         entry.consumer = self.owner;
         entry.provider = provider.order.plug_id;
-        entry.generation = provider.generation;
-        entry.method = method.id;
+        entry.generation = generation;
+        entry.method = method;
+        entry.credential = credential;
         runtime.bindings.emplace(slot, std::move(entry));
     } catch (...) {
         return runtime.fail(a::failed, "the method binding could not be stored");
@@ -228,7 +332,7 @@ a::status store_binding(context& self, record& provider, const owned_method& met
  *
  * @param type Requested service identifier; required.
  * @param out Receives the borrowed interface pointer, cleared first; required.
- * @return abi::v1::ok for a known service, unsupported for an unknown identifier,
+ * @return abi::v2::ok for a known service, unsupported for an unknown identifier,
  *         invalid_argument for a null argument, or failed on an escaping exception.
  * @note The returned pointer is the correct base subobject of this context and stays valid
  *       with the context; this operation reads no mutable host state and touches no plugin.
@@ -266,13 +370,18 @@ a::status U42_CALL context::query(const a::iid* type, void** out) noexcept
  * @brief Submit the complete capability set of a starting instance exactly once.
  *
  * @param value Capability description to copy; required.
- * @return abi::v1::ok, invalid_argument for a malformed description or empty method name,
- *         limit_exceeded for oversized counts or text, duplicate for a repeated interface
- *         id or a repeated method id/name, invalid_state outside a first start() or for the
+ * @return abi::v2::ok, invalid_argument for a malformed description, an empty method name, or
+ *         a protocol that is neither a valid contract nor the all-zero contract of an
+ *         instance without methods, limit_exceeded for oversized counts or text, duplicate
+ *         for a repeated method id or name, invalid_state outside a first start() or for the
  *         host administration context, wrong_thread, or failed.
  * @note Every string is copied before anything is committed, so a rejected announcement
  *       leaves the instance exactly as it was. Announcing does not publish: only a
  *       successful engine::commit makes the set discoverable.
+ * @note A non-empty method set must disclose a valid contract, that is a non-zero identity
+ *       and a positive major. The all-zero contract is accepted only together with an empty
+ *       method set, where it describes an instance that offers no business capability and can
+ *       therefore never be leased; a partially filled contract is always rejected.
  */
 a::status U42_CALL context::announce(const a::caps_desc* value) noexcept
 {
@@ -282,29 +391,29 @@ a::status U42_CALL context::announce(const a::caps_desc* value) noexcept
         if (value->struct_size != sizeof(a::caps_desc))
             return runtime.fail(a::invalid_argument,
                                 "caps_desc.struct_size does not match this ABI version");
-        if (value->interface_count > announce_entry_limit || value->method_count > announce_entry_limit)
+        if (value->method_count > announce_entry_limit)
             return runtime.fail(a::limit_exceeded, "the capability announcement exceeds the entry limit");
-        if (value->interface_count != 0 && !value->interfaces)
-            return runtime.fail(a::invalid_argument, "caps_desc.interfaces is null with a non-zero count");
         if (value->method_count != 0 && !value->methods)
             return runtime.fail(a::invalid_argument, "caps_desc.methods is null with a non-zero count");
+        const a::contract offered = value->protocol;
+        const bool empty_protocol = offered.id.high == 0 && offered.id.low == 0 && offered.major == 0 &&
+                                    offered.minor == 0;
+        if (empty_protocol) {
+            if (value->method_count != 0)
+                return runtime.fail(a::invalid_argument,
+                                    "an instance that announces methods must disclose a valid contract");
+        } else if (!a::valid_contract(offered)) {
+            return runtime.fail(a::invalid_argument,
+                                "the announced contract must name a non-zero identity and a positive major");
+        }
         if (!owner)
             return runtime.fail(a::invalid_state, "the host administration context cannot announce capabilities");
         record& self = *owner;
         if (self.state != phase::starting || self.announced)
             return runtime.fail(a::invalid_state, "capabilities may be announced once during start()");
 
-        capability_set next;
-        next.interfaces.reserve(value->interface_count);
-        for (std::uint32_t index = 0; index < value->interface_count; ++index) {
-            const a::iid candidate = value->interfaces[index];
-            for (const a::iid& known : next.interfaces) {
-                if (known == candidate)
-                    return runtime.fail(a::duplicate, "the announcement repeats an interface id");
-            }
-            next.interfaces.push_back(candidate);
-        }
-        next.methods.reserve(value->method_count);
+        std::vector<owned_method> methods;
+        methods.reserve(value->method_count);
         for (std::uint32_t index = 0; index < value->method_count; ++index) {
             const a::method_desc& source = value->methods[index];
             owned_method method;
@@ -323,15 +432,16 @@ a::status U42_CALL context::announce(const a::caps_desc* value) noexcept
             copied = copy_text(source.output_schema, method.output_schema);
             if (copied != a::ok)
                 return runtime.fail(copied, "an announced output schema exceeds the text limit");
-            for (const owned_method& known : next.methods) {
+            for (const owned_method& known : methods) {
                 if (known.id == method.id)
                     return runtime.fail(a::duplicate, "the announcement repeats a method id");
                 if (known.name == method.name)
                     return runtime.fail(a::duplicate, "the announcement repeats a method name");
             }
-            next.methods.push_back(std::move(method));
+            methods.push_back(std::move(method));
         }
-        self.capabilities = std::move(next);
+        self.capabilities.protocol = offered;
+        self.capabilities.methods = std::move(methods);
         self.announced = true;
         return a::ok;
     } catch (...) {
@@ -344,7 +454,7 @@ a::status U42_CALL context::announce(const a::caps_desc* value) noexcept
  *
  * @param sink Receiver owned by the caller until the watch is removed; required.
  * @param out Receives the watch token, cleared first; required.
- * @return abi::v1::ok, invalid_argument for a null sink, invalid_state while shutting down
+ * @return abi::v2::ok, invalid_argument for a null sink, invalid_state while shutting down
  *         or after revocation, limit_exceeded when no token remains, wrong_thread, or failed.
  * @note Snapshots for every published active instance are queued, never delivered here, so
  *       engine::drain can respect the batch gate while an initializing consumer is still
@@ -398,7 +508,7 @@ a::status U42_CALL context::watch(a::icap_sink* sink, a::token* out) noexcept
  * @brief Remove one capability watch owned by the calling context.
  *
  * @param value Watch token returned by watch(); zero is rejected.
- * @return abi::v1::ok, invalid_argument for a zero token or another context's watch,
+ * @return abi::v2::ok, invalid_argument for a zero token or another context's watch,
  *         stale for an unknown token, wrong_thread, or failed.
  * @note Queued notices for the removed token are dropped later by the watch-id check in
  *       engine::drain; this call only unregisters the sink.
@@ -422,64 +532,57 @@ a::status U42_CALL context::unwatch(a::token value) noexcept
 }
 
 /**
- * @brief Borrow an advertised interface from the current active provider instance.
+ * @brief Lease one Active instance under an explicitly accepted business contract.
  *
  * @param plug_id Provider identity; required and non-empty.
- * @param type Exact interface identifier to borrow; required.
+ * @param required Required valid contract; exact family/major and a sufficient minor.
  * @param receiver Revocation receiver that must be able to return the credential; required.
- * @param out Receives the interface pointer and credential, cleared first; required.
- * @return abi::v1::ok, invalid_argument for a null argument, invalid_state when the caller is
- *         not initialized/active or the provider is not active, not_found when the identity is
- *         unknown, unpublished or does not advertise type, busy when the provider is already
- *         executing, limit_exceeded when no credential remains, wrong_thread, or failed.
- * @note The interface pointer comes from the provider's own query, so it is stable for the
- *       lifetime of the borrow. A lease is recorded only for a successful non-null result.
+ * @param out Receives the credential only, cleared first; required.
+ * @return abi::v2::ok, invalid_argument for a null argument or an invalid required contract,
+ *         invalid_state when the caller is not initialized/active or the provider is not
+ *         active, not_found when the identity is unknown or unpublished, unsupported when the
+ *         provider discloses no usable or no compatible contract, limit_exceeded when no
+ *         credential remains, wrong_thread, or failed.
+ * @note This records a logical lock only: it reads the provider's already copied announcement,
+ *       never calls iplug::query or any other plugin entry point, and returns no provider
+ *       address. The recorded protocol is the requirement the consumer accepted; the recorded
+ *       generation pins the exact instance disclosure that satisfied it.
  */
-a::status U42_CALL context::acquire(const char* plug_id, const a::iid* type, a::irevoker* receiver,
-                                   a::borrow* out) noexcept
+a::status U42_CALL context::acquire(const char* plug_id, const a::contract* required, a::irevoker* receiver,
+                                    a::borrow* out) noexcept
 {
     try {
         if (!out) return a::invalid_argument;
         *out = a::borrow{};
         if (!runtime.on_thread()) return a::wrong_thread;
-        if (!plug_id || !type || !receiver)
+        if (!plug_id || !required || !receiver)
             return runtime.fail(a::invalid_argument,
-                                "acquire requires a plug_id, an iid and a revocation receiver");
+                                "acquire requires a plug_id, a required protocol and a revocation receiver");
+        if (!a::valid_contract(*required))
+            return runtime.fail(a::invalid_argument,
+                                "the required protocol must name a non-zero identity and a positive major");
         const a::status allowed = check_new_work(*this);
         if (allowed != a::ok) return allowed;
         record* provider = nullptr;
         const a::status resolved = resolve_active_provider(runtime, plug_id, provider);
         if (resolved != a::ok) return resolved;
-        if (std::find(provider->capabilities.interfaces.begin(), provider->capabilities.interfaces.end(),
-                      *type) == provider->capabilities.interfaces.end())
-            return runtime.fail(a::not_found, "the provider does not advertise the requested interface");
-        if (provider->depth != 0)
-            return runtime.fail(a::busy, "the provider is already executing a call");
-
-        void* raw = nullptr;
-        a::status queried = a::failed;
-        {
-            call_scope scope(runtime, *provider);
-            try {
-                queried = provider->instance->query(type, &raw);
-            } catch (...) {
-                return runtime.fail(a::failed, "the provider interface query threw an exception");
-            }
-        }
-        if (queried != a::ok)
-            return runtime.fail(queried, "the provider does not offer the requested interface");
-        if (!raw)
-            return runtime.fail(a::failed, "the provider returned a null interface pointer");
-
+        // Copy the disclosure before anything else can run: neither the lease nor this frame may
+        // keep a reference into the provider's capability set.
+        const a::contract offered = provider->capabilities.protocol;
+        const std::uint64_t generation = provider->generation;
+        if (!a::valid_contract(offered))
+            return runtime.fail(a::unsupported, "the provider discloses no usable business contract");
+        if (!a::compatible_contract(offered, *required))
+            return runtime.fail(a::unsupported,
+                                "the provider contract does not match the required family, major or minor");
         const std::uint64_t credential = take_token(runtime);
-        if (credential == 0) return runtime.fail(a::limit_exceeded, "no borrowing credentials remain");
+        if (credential == 0) return runtime.fail(a::limit_exceeded, "no lease credentials remain");
         try {
             runtime.leases.emplace(credential,
-                                   lease_record{owner, provider, provider->generation, *type, raw, receiver});
+                                   lease_record{owner, provider, generation, *required, receiver, 0});
         } catch (...) {
-            return runtime.fail(a::failed, "the borrowing record could not be stored");
+            return runtime.fail(a::failed, "the lease record could not be stored");
         }
-        out->ptr = raw;
         out->credential = a::token{credential};
         return a::ok;
     } catch (...) {
@@ -489,14 +592,17 @@ a::status U42_CALL context::acquire(const char* plug_id, const a::iid* type, a::
 }
 
 /**
- * @brief Return one credential owned by the calling context.
+ * @brief Return one lease owned by the calling context and drop the bindings it authorized.
  *
  * @param credential Credential obtained from acquire(); zero is rejected.
- * @return abi::v1::ok, invalid_argument for a zero credential or another context's credential,
- *         stale for a credential that no longer identifies a lease, wrong_thread, or failed.
+ * @return abi::v2::ok, invalid_argument for a zero credential or another context's credential,
+ *         stale for a credential that no longer identifies a lease, busy while the lease still
+ *         covers a call in flight, wrong_thread, or failed.
  * @note Release stays available in every state, including revocation and shutdown, because
- *       returning a borrow is a recovery action. A returned credential is erased, so an old
- *       value can never be matched against a later record.
+ *       returning a lease is a recovery action. A returned credential is erased together with
+ *       the bindings that named it, so an old credential can never be matched against a later
+ *       record and an old binding reports stale. Nothing is removed when the call fails: a
+ *       lease with calls in flight keeps existing until it has delivered their results.
  */
 a::status U42_CALL context::release(a::token credential) noexcept
 {
@@ -506,10 +612,19 @@ a::status U42_CALL context::release(a::token credential) noexcept
             return runtime.fail(a::invalid_argument, "release requires a non-zero credential");
         const auto found = runtime.leases.find(credential.value);
         if (found == runtime.leases.end())
-            return runtime.fail(a::stale, "the borrowing credential is no longer valid");
+            return runtime.fail(a::stale, "the lease credential is no longer valid");
         if (found->second.consumer != owner)
-            return runtime.fail(a::invalid_argument, "the borrowing credential belongs to another context");
+            return runtime.fail(a::invalid_argument, "the lease credential belongs to another context");
+        if (found->second.active_calls != 0)
+            return runtime.fail(a::busy,
+                                "the lease still covers a call in flight; retry release once it returns");
         runtime.leases.erase(found);
+        for (auto entry = runtime.bindings.begin(); entry != runtime.bindings.end();) {
+            if (entry->second.credential.value == credential.value)
+                entry = runtime.bindings.erase(entry);
+            else
+                ++entry;
+        }
         return a::ok;
     } catch (...) {
         return a::failed;
@@ -517,24 +632,39 @@ a::status U42_CALL context::release(a::token credential) noexcept
 }
 
 /**
- * @brief Bind the current method of an active provider by its published name.
+ * @brief Bind a published method name through a live lease owned by the calling context.
  *
- * @param plug_id Provider identity; required and non-empty.
+ * @param credential Lease credential returned by acquire(); zero is rejected.
  * @param name Announced method name; required and non-empty.
  * @param out Receives the opaque binding, cleared first; required.
- * @return abi::v1::ok, invalid_argument for a null or empty key, invalid_state when the caller
- *         is not initialized/active or the provider is not active, not_found when the identity
- *         is unknown, unpublished or does not announce name, limit_exceeded when no token
- *         remains, wrong_thread, or failed.
+ * @return abi::v2::ok, invalid_argument for a zero credential, a null or empty key, or another
+ *         context's credential, stale when the credential no longer names a lease or its
+ *         provider generation is gone, not_found when the provider is unknown, unpublished or
+ *         does not announce name, invalid_state when the caller may not start new work or the
+ *         provider cannot serve calls, limit_exceeded when no token remains, wrong_thread, or
+ *         failed.
+ * @note A binding exists only because a lease exists: the credential is stored with it and is
+ *       what release() uses to forget it again. The binding keeps no provider pointer, so it
+ *       never keeps the provider alive and never follows a reload.
  */
-a::status U42_CALL context::bind_name(const char* plug_id, const char* name, a::binding* out) noexcept
+a::status U42_CALL context::bind_name(a::token credential, const char* name, a::binding* out) noexcept
 {
     try {
         if (!out) return a::invalid_argument;
         *out = a::binding{};
         if (!runtime.on_thread()) return a::wrong_thread;
-        if (!plug_id || !name)
-            return runtime.fail(a::invalid_argument, "bind_name requires a plug_id and a method name");
+        if (credential.value == 0)
+            return runtime.fail(a::invalid_argument, "bind_name requires a non-zero lease credential");
+        if (!name) return runtime.fail(a::invalid_argument, "bind_name requires a method name");
+        const auto lease = runtime.leases.find(credential.value);
+        if (lease == runtime.leases.end())
+            return runtime.fail(a::stale, "the lease credential is no longer valid");
+        if (lease->second.consumer != owner)
+            return runtime.fail(a::invalid_argument, "the lease credential belongs to another context");
+        const std::uint64_t generation = lease->second.generation;
+        record* provider = nullptr;
+        const a::status resolved = check_leased_provider(runtime, lease->second.provider, generation, provider);
+        if (resolved != a::ok) return resolved;
         const a::status allowed = check_new_work(*this);
         if (allowed != a::ok) return allowed;
         std::size_t name_size = 0;
@@ -542,19 +672,18 @@ a::status U42_CALL context::bind_name(const char* plug_id, const char* name, a::
         if (checked != a::ok)
             return runtime.fail(checked, "the method name must be a bounded non-empty string");
         const std::string wanted(name, name_size);
-        record* provider = nullptr;
-        const a::status resolved = resolve_active_provider(runtime, plug_id, provider);
-        if (resolved != a::ok) return resolved;
-        const owned_method* method = nullptr;
+        bool announced = false;
+        a::method_id id = 0;
         for (const owned_method& candidate : provider->capabilities.methods) {
             if (candidate.name == wanted) {
-                method = &candidate;
+                id = candidate.id;
+                announced = true;
                 break;
             }
         }
-        if (!method)
+        if (!announced)
             return runtime.fail(a::not_found, "the provider does not announce method '" + wanted + "'");
-        return store_binding(*this, *provider, *method, out);
+        return store_binding(*this, *provider, generation, id, credential, out);
     } catch (...) {
         if (out) *out = a::binding{};
         return a::failed;
@@ -562,37 +691,48 @@ a::status U42_CALL context::bind_name(const char* plug_id, const char* name, a::
 }
 
 /**
- * @brief Bind the current method of an active provider by its published numeric id.
+ * @brief Bind a published numeric method id through a live lease owned by the caller.
  *
- * @param plug_id Provider identity; required and non-empty.
+ * @param credential Lease credential returned by acquire(); zero is rejected.
  * @param id Announced method id.
  * @param out Receives the opaque binding, cleared first; required.
- * @return abi::v1::ok, invalid_argument for a null key, invalid_state when the caller is not
- *         initialized/active or the provider is not active, not_found when the identity is
- *         unknown, unpublished or does not announce id, limit_exceeded when no token remains,
- *         wrong_thread, or failed.
+ * @return abi::v2::ok, invalid_argument for a zero credential or another context's credential,
+ *         stale when the credential no longer names a lease or its provider generation is
+ *         gone, not_found when the provider is unknown, unpublished or does not announce id,
+ *         invalid_state when the caller may not start new work or the provider cannot serve
+ *         calls, limit_exceeded when no token remains, wrong_thread, or failed.
+ * @note Numeric and named lookup share the same lease and generation checks and produce the
+ *       same kind of binding.
  */
-a::status U42_CALL context::bind_id(const char* plug_id, a::method_id id, a::binding* out) noexcept
+a::status U42_CALL context::bind_id(a::token credential, a::method_id id, a::binding* out) noexcept
 {
     try {
         if (!out) return a::invalid_argument;
         *out = a::binding{};
         if (!runtime.on_thread()) return a::wrong_thread;
+        if (credential.value == 0)
+            return runtime.fail(a::invalid_argument, "bind_id requires a non-zero lease credential");
+        const auto lease = runtime.leases.find(credential.value);
+        if (lease == runtime.leases.end())
+            return runtime.fail(a::stale, "the lease credential is no longer valid");
+        if (lease->second.consumer != owner)
+            return runtime.fail(a::invalid_argument, "the lease credential belongs to another context");
+        const std::uint64_t generation = lease->second.generation;
+        record* provider = nullptr;
+        const a::status resolved = check_leased_provider(runtime, lease->second.provider, generation, provider);
+        if (resolved != a::ok) return resolved;
         const a::status allowed = check_new_work(*this);
         if (allowed != a::ok) return allowed;
-        record* provider = nullptr;
-        const a::status resolved = resolve_active_provider(runtime, plug_id, provider);
-        if (resolved != a::ok) return resolved;
-        const owned_method* method = nullptr;
+        bool announced = false;
         for (const owned_method& candidate : provider->capabilities.methods) {
             if (candidate.id == id) {
-                method = &candidate;
+                announced = true;
                 break;
             }
         }
-        if (!method)
+        if (!announced)
             return runtime.fail(a::not_found, "the provider does not announce that method id");
-        return store_binding(*this, *provider, *method, out);
+        return store_binding(*this, *provider, generation, id, credential, out);
     } catch (...) {
         if (out) *out = a::binding{};
         return a::failed;
@@ -605,17 +745,22 @@ a::status U42_CALL context::bind_id(const char* plug_id, a::method_id id, a::bin
  * @param target Binding obtained from bind_name()/bind_id(); zero is rejected.
  * @param args Borrowed JSON arguments, valid for this call only.
  * @param result Caller-owned writer; required and written at most once on success.
- * @return abi::v1::ok, invalid_argument for a zero binding, a null writer, an inconsistent
- *         argument view or another context's binding, stale for an unknown binding, a missing
- *         provider instance or a provider generation change, not_found when the provider
- *         withdrew its capabilities, invalid_state when the caller is not active or the host
- *         is shutting down, busy on provider reentry, limit_exceeded when the arguments or the
- *         output exceed the configured bounds, wrong_thread, or failed.
- * @note The binding is validated before the caller's own state, so a binding whose provider
- *       generation is gone reports stale even after the provider was unloaded or the whole
- *       host shut down. Output is buffered host-side: a failing invocation, or a writer that
- *       reports a sticky failure, discards the partial result instead of forwarding it, so the
- *       external writer receives at most one complete, bounded payload.
+ * @return abi::v2::ok, invalid_argument for a zero binding, a null writer, an inconsistent
+ *         argument view, or another context's binding or lease, stale for a binding whose lease
+ *         or provider generation is gone, not_found when the provider withdrew its
+ *         capabilities, invalid_state when the caller is not active or the host is shutting
+ *         down, busy on provider reentry, limit_exceeded when the arguments or the output
+ *         exceed the configured bounds, wrong_thread, or failed.
+ * @note The binding, its lease and the provider generation are validated before any plugin code
+ *       runs, and the provider is reached only through the host-owned iinvoke that the publish
+ *       step obtained from query(invoke_iid). Every field needed from the binding is copied
+ *       first, because a nested unbind may erase that entry during the call and this frame must
+ *       never keep using a dangling reference. The lease's in-flight counter covers the invoke
+ *       and the delivery of its result, so a release from inside that window reports busy
+ *       instead of dropping the lock under an ongoing call. Output is buffered host-side: a
+ *       failing invocation, or a writer that reports a sticky failure, discards the partial
+ *       result instead of forwarding it, so the external writer receives at most one complete,
+ *       bounded payload.
  */
 a::status U42_CALL context::call(a::binding target, a::bytes args, a::iwriter* result) noexcept
 {
@@ -629,15 +774,34 @@ a::status U42_CALL context::call(a::binding target, a::bytes args, a::iwriter* r
             return runtime.fail(a::stale, "the method binding is no longer valid");
         if (found->second.consumer != owner)
             return runtime.fail(a::invalid_argument, "the method binding belongs to another context");
-        const bound_method& binding = found->second;
-        // The binding is resolved before the caller's own state: once the provider generation is
-        // gone the binding can never be used again, and that stays stale even while the host is
-        // winding down or the caller has already stopped.
-        record* provider = find_record(runtime, binding.provider);
-        if (!provider)
-            return runtime.fail(a::stale, "the provider instance is gone; the binding must be recreated");
-        if (provider->generation != binding.generation)
-            return runtime.fail(a::stale, "the provider was reloaded; the binding must be recreated");
+        // Copy everything this frame needs before plugin code can run: a nested unbind may erase
+        // this entry, so no reference into engine::bindings may survive the copy.
+        const std::string provider_id = found->second.provider;
+        const std::uint64_t generation = found->second.generation;
+        const a::method_id method = found->second.method;
+        const std::uint64_t credential = found->second.credential.value;
+        // The binding is resolved before the caller's own state: once its lease or the provider
+        // generation is gone the binding can never be used again, and that stays stale even
+        // while the host is winding down or the caller has already stopped.
+        record* provider = nullptr;
+        {
+            // The lease iterator is confined to this block: it is read only while no plugin code
+            // can run, so no map reference is ever alive across a callback.
+            const auto lease = runtime.leases.find(credential);
+            if (lease == runtime.leases.end())
+                return runtime.fail(a::stale,
+                                    "the lease behind this binding is gone; the binding must be recreated");
+            if (lease->second.consumer != owner)
+                return runtime.fail(a::invalid_argument,
+                                    "the lease behind this binding belongs to another context");
+            if (lease->second.generation != generation)
+                return runtime.fail(a::stale, "the binding does not match the generation of its lease");
+            const a::status resolved =
+                check_leased_provider(runtime, lease->second.provider, generation, provider);
+            if (resolved != a::ok) return resolved;
+        }
+        if (provider->order.plug_id != provider_id)
+            return runtime.fail(a::stale, "the binding no longer names the provider it was created from");
         if (owner && owner->state != phase::active)
             return runtime.fail(a::invalid_state, "only an active instance may call business methods");
         if (runtime.shutting_down)
@@ -646,22 +810,24 @@ a::status U42_CALL context::call(a::binding target, a::bytes args, a::iwriter* r
             return runtime.fail(a::invalid_argument, "call arguments need a data pointer for a non-zero size");
         if (args.size > runtime.options.payload_limit)
             return runtime.fail(a::limit_exceeded, "call arguments exceed the configured payload limit");
-        if (!provider->published)
-            return runtime.fail(a::not_found, "the provider has withdrawn its capabilities");
-        if (provider->state != phase::active)
-            return runtime.fail(a::invalid_state, "the provider is not active");
-        if (!provider->instance || !provider->invoker)
+        if (!provider->invoker)
             return runtime.fail(a::failed, "the provider has no invoke interface");
         if (provider->depth != 0)
             return runtime.fail(a::busy, "the provider is already executing a call");
+        // Count this call against the lease before entering plugin code. The guard balances the
+        // counter on every exit path and covers the invoke plus the delivery of its result.
+        const a::status begun = begin_active_call(runtime, credential);
+        if (begun != a::ok) return begun;
+        active_call_guard in_flight(runtime, credential);
+        in_flight.arm();
 
-        const a::method_id method = binding.method;
+        a::iinvoke* invoker = provider->invoker;
         string_writer writer(runtime.options.output_limit);
         a::status invoked = a::failed;
         {
             call_scope scope(runtime, *provider);
             try {
-                invoked = provider->invoker->invoke(method, args, &writer);
+                invoked = invoker->invoke(method, args, &writer);
             } catch (...) {
                 return runtime.fail(a::failed, "the provider invocation threw an exception");
             }
@@ -688,10 +854,13 @@ a::status U42_CALL context::call(a::binding target, a::bytes args, a::iwriter* r
  * @brief Release one method binding owned by the calling context.
  *
  * @param target Binding to release; zero is rejected.
- * @return abi::v1::ok, invalid_argument for a zero value or another context's binding,
+ * @return abi::v2::ok, invalid_argument for a zero value or another context's binding,
  *         stale for an unknown binding, wrong_thread, or failed.
- * @note Binding never kept the provider alive, so unbinding does not affect the provider.
- *       Unbind stays available in every state, including revocation and shutdown.
+ * @note A binding never kept the provider alive, so unbinding does not affect the provider and
+ *       does not return the lease: release() is what drops the lease and its lock. Unbind stays
+ *       available in every state, including revocation and shutdown, and may be called from
+ *       inside the invocation that owns the binding, which then finishes with the fields it
+ *       already copied.
  */
 a::status U42_CALL context::unbind(a::binding target) noexcept
 {
@@ -738,12 +907,14 @@ void U42_CALL context::log(const char* message) noexcept
  *
  * @param target Instance whose start() just succeeded; the lifecycle owner has already moved
  *               it to active.
- * @return abi::v1::ok, not_found/invalid_state when the instance may not publish, busy when the
+ * @return abi::v2::ok, not_found/invalid_state when the instance may not publish, busy when the
  *         instance is re-entered, wrong_thread, or failed.
  * @note An instance that announces methods must answer query(invoke_iid); an instance with an
- *       empty set publishes without any plugin call and still notifies watchers. Notices are
- *       queued only - no sink is called here - and are rolled back if queuing fails, so the
- *       instance is never published without its watchers being able to learn about it.
+ *       empty set publishes without any plugin call and still notifies watchers. The disclosed
+ *       contract and every method description are copied host-side, and query(invoke_iid) is
+ *       the only plugin hook this step ever calls. Notices are queued only - no sink is called
+ *       here - and are rolled back if queuing fails, so the instance is never published without
+ *       its watchers being able to learn about it.
  */
 a::status engine::commit(record& target)
 {
@@ -804,7 +975,7 @@ a::status engine::commit(record& target)
  * @brief Withdraw an instance from the available capability table and notify watchers.
  *
  * @param target Instance leaving the active state.
- * @return abi::v1::ok when the instance is withdrawn or was already withdrawn, wrong_thread off
+ * @return abi::v2::ok when the instance is withdrawn or was already withdrawn, wrong_thread off
  *         the control thread, or failed when the withdrawal notices could not all be queued.
  * @note The operation is transactional: it either queues exactly one withdrawal notice per live
  *       watch and then leaves the instance unpublished, or it leaves both the instance and the
@@ -841,16 +1012,22 @@ a::status engine::withdraw(record& target)
 }
 
 /**
- * @brief Notify and collect every incoming borrow held from one provider instance.
+ * @brief Notify and collect every incoming lease held from one provider instance.
  *
  * @param target Provider instance being revoked.
- * @return abi::v1::ok when every lease is gone, busy while a consumer keeps a credential or
- *         cannot be called back, wrong_thread, or failed on an escaping exception.
+ * @return abi::v2::ok when every lease is gone, busy while a consumer keeps a credential,
+ *         cannot be called back or still has a call in flight, wrong_thread, or failed on an
+ *         escaping exception.
  * @note Credentials are snapshotted first because one callback may return several leases and
  *       therefore invalidate every iterator into engine::leases; each credential is
  *       re-resolved before and after its callback. A consumer that is currently executing is
  *       left for a later attempt, and a lease whose consumer record no longer exists is
- *       dropped instead of dereferenced.
+ *       dropped instead of dereferenced. No lease a live consumer still owns is ever erased
+ *       here: only that consumer can return it, so an uncooperative consumer keeps the
+ *       provider pinned instead of having its lease fabricated away.
+ * @note A callback for the administration context has no record to nest under, so it runs with
+ *       engine::depth raised directly. That still keeps a revoker from running a structural
+ *       host operation (start, load, unload, shutdown) against the lease table it observes.
  */
 a::status engine::revoke(record& target)
 {
@@ -870,12 +1047,22 @@ a::status engine::revoke(record& target)
             a::irevoker* receiver = found->second.receiver;
             const bool live = record_is_live(*this, consumer);
             if (consumer && !live) {
-                // The owning instance is gone; nothing can use or return the pointer.
+                // The owning instance no longer exists, so nothing can use or return this
+                // credential. A removed consumer drops its outgoing leases with it, which makes
+                // this branch a defensive case; it never applies to a live consumer.
                 leases.erase(found);
                 continue;
             }
             if (!receiver) {
-                leases.erase(found);
+                // No one can be asked to return the credential. Pin the provider instead of
+                // pretending the lease was returned; the owning context may still release it.
+                any_busy = true;
+                continue;
+            }
+            if (found->second.active_calls != 0) {
+                // The consumer is inside a call that is still delivering its result; calling back
+                // into it now would be a callback inside a callback. Retry once it returns.
+                any_busy = true;
                 continue;
             }
             if (live && consumer->depth != 0) {
@@ -891,6 +1078,7 @@ a::status engine::revoke(record& target)
                     threw = true;
                 }
             } else {
+                runtime_depth_scope scope(*this);
                 try {
                     receiver->on_revoke(a::token{credential});
                 } catch (...) {
@@ -920,6 +1108,9 @@ a::status engine::revoke(record& target)
  *       protocol. Pending notices carry only the watch id and provider identity, never a record
  *       pointer, so an already queued capability notice cannot keep this instance alive and is
  *       dropped by engine::drain once its watch id is gone.
+ * @note The lifecycle owner calls this only after a successful stop(); a consumer whose stop()
+ *       failed keeps its outgoing leases, which is what pins the providers it borrowed from
+ *       until the operator resolves the quarantine.
  */
 void engine::remove_owner(record& target)
 {

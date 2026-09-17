@@ -3,14 +3,25 @@
  * @brief End-to-end rack test over real plugin DSOs; no third-party test framework.
  *
  * Usage: integration_test <plugins_dir> <bad_abi_library> <missing_entry_library>
+ *                        <legacy_v1_library>
  *   plugins_dir           directory holding the echo and consumer plugin DSOs
  *   bad_abi_library       DSO exporting u42_get_factory, which rejects the ABI major
  *   missing_entry_library DSO exporting an unrelated symbol and no u42_get_factory
+ *   legacy_v1_library     frozen ABI v1 DSO, required so its refusal is always verified
  *
  * The file owns its main(); it links against the 42u library (u42::host, u42::plug and
- * u42::scan_plugins) and needs the two negative-fixture DSOs present at runtime. Every
+ * u42::scan_plugins) and needs the three negative-fixture DSOs present at runtime. Every
  * temporary directory is created below the system temp directory under a unique name and
  * removed again before the check that created it returns.
+ *
+ * @note All plugin-to-plugin business traffic goes consumer -> host icalls -> provider iinvoke:
+ *       this test never receives nor stores a plugin interface pointer. It holds only opaque
+ *       borrow credentials, binds methods through them, and keeps every irevoker alive until its
+ *       credential has actually been returned.
+ * @note The legacy ABI v1 fixture is passed as its own argument instead of living in
+ *       plugins_dir: a v2 scan of a directory containing it would refuse the whole batch. The
+ *       argument is required, so a caller cannot pass only three paths and mistake a partial
+ *       run for a complete one.
  *
  * @note NDEBUG is defined deliberately: CHECK must keep reporting failures even when
  *       assert() has been compiled out, so a diagnostic can never vanish in release builds.
@@ -43,13 +54,13 @@
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
 namespace fs = std::filesystem;
 
 using u42::host;
 using u42::plug;
 
-/** @brief Plugin identity and method contract published by the example plugins. */
+/** @brief Plugin identity and method names published by the example plugins. */
 constexpr const char* kEchoPlugId = "com.example.echo";
 constexpr const char* kConsumerPlugId = "com.example.consumer";
 constexpr const char* kEchoMethod = "echo";
@@ -58,6 +69,38 @@ constexpr abi::method_id kEchoMethodId = 1;
 constexpr abi::method_id kStatusMethodId = 1;
 constexpr const char* kEchoPayload = "42u integration payload";
 constexpr const char* kFixtureDummySymbol = "u42_fixture_unrelated_symbol";
+/** @brief Plugin identity that no fixture announces, used for lookup negatives. */
+constexpr const char* kMissingPlugId = "com.example.absent";
+
+/**
+ * @brief Business protocols frozen by the implementation contract for the example plugins.
+ *
+ * The values repeat the data-only contract of examples/echo.hpp instead of including that
+ * header: the header belongs to another task and must not become a build dependency of this
+ * standalone test. Only plain data is duplicated here; no interface type and no virtual class
+ * is shared with any plugin, which is exactly the boundary ABI v2 requires.
+ */
+inline constexpr abi::iid kEchoProtocolId{0x6563686f34325532ULL, 1};
+inline constexpr abi::iid kConsumerProtocolId{0x636f6e7334325532ULL, 1};
+inline constexpr abi::iid kForeignProtocolId{0x646f65736e6f7431ULL, 1};
+/** @brief Protocol announced by the echo provider: family kEchoProtocolId, major 1, minor 0. */
+inline constexpr abi::contract kEchoRequired{kEchoProtocolId, 1, 0};
+/** @brief Same family and major but a higher minimum minor, which the provider must refuse. */
+inline constexpr abi::contract kEchoRequiredMinor2{kEchoProtocolId, 1, 1};
+/** @brief Protocol the consumer announces for its own status method. */
+inline constexpr abi::contract kConsumerRequired{kConsumerProtocolId, 1, 0};
+/** @brief Unrelated family that no example plugin announces. */
+inline constexpr abi::contract kForeignRequired{kForeignProtocolId, 1, 0};
+
+/**
+ * @brief Frozen symbols and layout word of tests/fixtures/legacy_v1.cc.
+ *
+ * The fixture deliberately includes no header, so this probe repeats the frozen names and the
+ * object's identity word instead of sharing a declaration with it.
+ */
+constexpr const char* kLegacyObjectAddressSymbol = "u42_legacy_object_address";
+constexpr const char* kLegacyObjectMagicSymbol = "u42_legacy_object_magic_word";
+constexpr std::uint64_t kLegacyObjectMagic = 0x004c454741435931ULL;
 
 /** @brief Label of the phase currently running; every failure prints it. */
 const char* g_phase = "<startup>";
@@ -145,7 +188,7 @@ void expect_status(abi::status actual, abi::status expected, const char* what)
           static_cast<unsigned>(expected), status_name(actual), static_cast<unsigned>(actual));
 }
 
-/** @brief Require abi::v1::ok. */
+/** @brief Require abi::v2::ok. */
 void expect_ok(abi::status actual, const char* what)
 {
     expect_status(actual, abi::ok, what);
@@ -476,13 +519,19 @@ consumer_view read_consumer_status(host& rack, bool by_id, const char* label)
 {
     std::string out;
     // The status method takes no mandatory argument; an empty object is accepted as the
-    // fallback spelling so the plugin may validate the JSON argument either way.
-    abi::status called = by_id ? rack.call(kConsumerPlugId, kStatusMethodId, abi::bytes{}, &out)
-                               : rack.call(kConsumerPlugId, kStatusMethod, abi::bytes{}, &out);
+    // fallback spelling so the plugin may validate the JSON argument either way. The explicit
+    // protocol is the consumer's own disclosed contract, never the provider's.
+    abi::status called = by_id
+                             ? rack.call(kConsumerPlugId, kConsumerRequired, kStatusMethodId, abi::bytes{}, &out)
+                             : rack.call(kConsumerPlugId, kConsumerRequired, kStatusMethod, abi::bytes{}, &out);
     if (called != abi::ok) {
         out.clear();
-        called = by_id ? rack.call(kConsumerPlugId, kStatusMethodId, bytes_of(std::string("{}")), &out)
-                       : rack.call(kConsumerPlugId, kStatusMethod, bytes_of(std::string("{}")), &out);
+        const std::string empty_object = "{}";
+        called = by_id
+                     ? rack.call(kConsumerPlugId, kConsumerRequired, kStatusMethodId,
+                                 bytes_of(empty_object), &out)
+                     : rack.call(kConsumerPlugId, kConsumerRequired, kStatusMethod,
+                                 bytes_of(empty_object), &out);
     }
     expect_ok(called, label);
     return parse_consumer_status(out);
@@ -606,6 +655,88 @@ void loader_negative_checks(const fs::path& bad_abi_library, const fs::path& mis
         CHECK(error.find(abi::entry_name) != std::string::npos);
         CHECK(library.factory() == nullptr);
         CHECK(library.path().empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frozen ABI v1 refusal.
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Require a frozen ABI v1 DSO to keep serving only major 1 and to be refused by v2.
+ *
+ * @param legacy_library Path to the library built from tests/fixtures/legacy_v1.cc, passed as
+ *                       the optional fifth command-line argument.
+ *
+ * @note The probe first calls the fixture's own retired entry directly, which proves the library
+ *       is a working v1 provider rather than a broken mapping. Only then does it require the v2
+ *       negotiation, u42::plug::open() and host::load() to refuse it, and the host to stay empty.
+ * @note This phase is mandatory because its library must never sit in plugins_dir: a v2 scan of
+ *       that directory would refuse the whole batch instead of just this candidate, so the
+ *       refusal is verified through an explicitly passed path.
+ */
+void legacy_v1_checks(const fs::path& legacy_library)
+{
+    phase_guard guard("legacy ABI v1");
+
+    if (!fs::exists(legacy_library)) {
+        failf(__FILE__, __LINE__, "legacy ABI v1 fixture is missing: '%s'",
+              legacy_library.string().c_str());
+    }
+
+    {
+        void* handle = map_native(legacy_library);
+        if (handle == nullptr) {
+            failf(__FILE__, __LINE__, "cannot map legacy ABI v1 fixture '%s'",
+                  legacy_library.string().c_str());
+        }
+        // The retired entry takes the v1 profile: a uint32_t major plus a void** factory slot.
+        // Only the caller's expectation changed; nothing about the fixture is reinterpreted.
+        using legacy_entry_fn = abi::status(U42_CALL*)(std::uint32_t, void**) noexcept;
+        using legacy_address_fn = void*(U42_CALL*)() noexcept;
+        using legacy_magic_fn = std::uint64_t(U42_CALL*)() noexcept;
+        const auto entry =
+            reinterpret_cast<legacy_entry_fn>(native_symbol(handle, abi::entry_name));
+        const auto object_address = reinterpret_cast<legacy_address_fn>(
+            native_symbol(handle, kLegacyObjectAddressSymbol));
+        const auto magic_word =
+            reinterpret_cast<legacy_magic_fn>(native_symbol(handle, kLegacyObjectMagicSymbol));
+        CHECK(entry != nullptr);
+        CHECK(object_address != nullptr);
+        CHECK(magic_word != nullptr);
+
+        // major 1: the retired profile still works and hands out one recognizable static object.
+        void* object = reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
+        expect_status(entry(1, &object), abi::ok, "legacy entry(1)");
+        CHECK(object == object_address());
+        CHECK(*static_cast<const std::uint64_t*>(object) == kLegacyObjectMagic);
+        CHECK(magic_word() == kLegacyObjectMagic);
+
+        // major 2 (the current profile): refused, with the poisoned output slot cleared.
+        object = reinterpret_cast<void*>(static_cast<std::uintptr_t>(1));
+        expect_status(entry(2, &object), abi::unsupported, "legacy entry(2)");
+        CHECK(object == nullptr);
+
+        // A null output slot is an argument error rather than a successful negotiation.
+        expect_status(entry(2, nullptr), abi::invalid_argument, "legacy entry(2, null)");
+        unmap_native(handle);
+    }
+    {
+        // The v2 loader must refuse to negotiate the legacy library at all.
+        plug library;
+        std::string error;
+        expect_status(library.open(legacy_library, error), abi::unsupported, "plug::open(legacy v1)");
+        CHECK(!error.empty());
+        CHECK(library.factory() == nullptr);
+        CHECK(library.path().empty());
+    }
+    {
+        // Hot-loading it must fail and leave the rack empty instead of staging a v1 instance.
+        host rack;
+        CHECK(rack.load(legacy_library) != abi::ok);
+        CHECK(!rack.error().empty());
+        CHECK(rack.plugins().empty());
+        expect_ok(rack.shutdown(), "shutdown() after legacy rejection");
     }
 }
 
@@ -770,7 +901,41 @@ plugin_paths discover_plugins(const fs::path& directory)
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Exercise boot, name/ID parity, unload, reload, stale bindings and shutdown.
+ * @brief Administration-side revocation target used by the native lease checks.
+ *
+ * @note The host stores this object's address when acquire() succeeds and may call on_revoke()
+ *       from a later unload of the provider, so it must stay alive and reachable until the
+ *       credential has actually been returned. It returns the credential synchronously because
+ *       an outstanding lease pins the provider and blocks its teardown.
+ */
+struct admin_revoker final : abi::irevoker {
+    /** @brief Host that issued the lease; borrowed and alive for every revocation. */
+    host* rack = nullptr;
+    /** @brief Number of on_revoke() deliveries seen so far. */
+    int revocations = 0;
+    /** @brief Credential delivered by the most recent revocation. */
+    abi::token last_credential{};
+    /** @brief Status observed while returning that credential. */
+    abi::status last_release = abi::ok;
+
+    /**
+     * @brief Return the revoked credential so the provider can be torn down.
+     *
+     * @param credential Credential the host is revoking; never zero.
+     * @note The status is recorded rather than asserted here because on_revoke() runs inside a
+     *       host operation; the lifecycle check below reports a surprise with full context.
+     */
+    void U42_CALL on_revoke(abi::token credential) noexcept override
+    {
+        ++revocations;
+        last_credential = credential;
+        last_release = rack != nullptr ? rack->release(credential) : abi::invalid_state;
+    }
+};
+
+/**
+ * @brief Exercise protocol discovery, leases, name/ID parity, unload, reload, stale handles
+ *        and shutdown.
  *
  * @param plugins_dir Directory holding both example plugins.
  * @param paths Resolved plugin library paths.
@@ -785,15 +950,38 @@ void integration_lifecycle(const fs::path& plugins_dir, const plugin_paths& path
     CHECK(has_plugin(ids, kEchoPlugId));
     CHECK(has_plugin(ids, kConsumerPlugId));
 
+    // Explicit administration discovery returns protocol data, never a plugin interface pointer,
+    // and a rejected lookup clears the caller's slot instead of fabricating a contract.
+    abi::contract offered{};
+    expect_ok(rack.protocol(kEchoPlugId, &offered), "protocol(echo)");
+    CHECK(abi::valid_contract(offered));
+    CHECK(offered.id == kEchoRequired.id);
+    CHECK(offered.major == kEchoRequired.major);
+    CHECK(abi::compatible_contract(offered, kEchoRequired));
+    abi::contract absent = kEchoRequired;
+    CHECK(rack.protocol(kMissingPlugId, &absent) != abi::ok);
+    CHECK(!abi::valid_contract(absent));
+
     const std::string payload = kEchoPayload;
     std::string echoed_by_name;
     std::string echoed_by_id;
-    expect_ok(rack.call(kEchoPlugId, kEchoMethod, bytes_of(payload), &echoed_by_name),
-              "call(echo, name)");
-    expect_ok(rack.call(kEchoPlugId, kEchoMethodId, bytes_of(payload), &echoed_by_id),
-              "call(echo, id)");
+    expect_ok(rack.call(kEchoPlugId, kEchoRequired, kEchoMethod, bytes_of(payload), &echoed_by_name),
+              "call(echo, name, required)");
+    expect_ok(rack.call(kEchoPlugId, kEchoRequired, kEchoMethodId, bytes_of(payload), &echoed_by_id),
+              "call(echo, id, required)");
     CHECK(echoed_by_name == payload);
     CHECK(echoed_by_id == payload);
+
+    // The one-shot call takes an explicit protocol: a foreign family or a too-new minimum minor
+    // is refused instead of silently downgraded, and the output slot stays cleared.
+    std::string refused_output = "must be cleared";
+    CHECK(rack.call(kEchoPlugId, kForeignRequired, kEchoMethod, bytes_of(payload), &refused_output) !=
+          abi::ok);
+    CHECK(refused_output.empty());
+    refused_output = "must be cleared";
+    CHECK(rack.call(kEchoPlugId, kEchoRequiredMinor2, kEchoMethod, bytes_of(payload), &refused_output) !=
+          abi::ok);
+    CHECK(refused_output.empty());
 
     const consumer_view booted = read_consumer_status(rack, false, "consumer status after boot");
     const consumer_view booted_by_id = read_consumer_status(rack, true, "consumer status by id after boot");
@@ -802,14 +990,45 @@ void integration_lifecycle(const fs::path& plugins_dir, const plugin_paths& path
     CHECK(booted_by_id.revocations == booted.revocations);
     CHECK(booted_by_id.events == booted.events);
 
+    // Administration lease: bind() exists only below a live credential, and the revoker must
+    // stay alive until the credential has actually been returned.
+    admin_revoker revoker;
+    revoker.rack = &rack;
+    abi::borrow refused_lease{abi::token{0x5a5a5a5aULL}};
+    expect_status(rack.acquire(kEchoPlugId, kForeignRequired, &revoker, &refused_lease),
+                  abi::unsupported, "acquire(foreign protocol)");
+    CHECK(refused_lease.credential.value == 0);
+    refused_lease = abi::borrow{abi::token{0x5a5a5a5aULL}};
+    expect_status(rack.acquire(kEchoPlugId, kEchoRequiredMinor2, &revoker, &refused_lease),
+                  abi::unsupported, "acquire(minor too new)");
+    CHECK(refused_lease.credential.value == 0);
+
+    abi::borrow lease{};
+    expect_ok(rack.acquire(kEchoPlugId, kEchoRequired, &revoker, &lease), "acquire(echo)");
+    CHECK(lease.credential.value != 0);
+    CHECK(revoker.revocations == 0);
+
+    // A zero credential cannot bind anything: there is no plugin-side shortcut without a lease.
+    abi::binding refused_binding{};
+    expect_status(rack.bind(abi::token{}, kEchoMethod, &refused_binding), abi::invalid_argument,
+                  "bind(zero credential)");
+    CHECK(refused_binding.value == 0);
+
     abi::binding old_binding{};
-    expect_ok(rack.bind(kEchoPlugId, kEchoMethod, &old_binding), "bind(echo, name)");
+    expect_ok(rack.bind(lease.credential, kEchoMethod, &old_binding), "bind(echo, name)");
     CHECK(old_binding.value != 0);
     std::string live_output;
-    expect_ok(rack.call(old_binding, bytes_of(payload), &live_output), "call(old binding)");
+    expect_ok(rack.call(old_binding, bytes_of(payload), &live_output), "call(lease binding)");
     CHECK(live_output == payload);
 
+    // Unloading the provider revokes the administration lease synchronously: the revoker returns
+    // the credential from inside on_revoke(), which is what lets the unload complete.
+    const abi::token first_credential = lease.credential;
     expect_ok(rack.unload(kEchoPlugId), "unload(echo)");
+    CHECK(revoker.revocations == 1);
+    CHECK(revoker.last_credential.value == first_credential.value);
+    CHECK(revoker.last_release == abi::ok);
+    lease = abi::borrow{}; // The revoker returned it; this test no longer owns it.
     CHECK(!has_plugin(rack.plugins(), kEchoPlugId));
     const consumer_view parked = pump_until_connected(rack, false, 8, "consumer status after unload");
     CHECK(parked.revocations == 1);
@@ -819,7 +1038,12 @@ void integration_lifecycle(const fs::path& plugins_dir, const plugin_paths& path
                   "call(old binding) after unload");
     CHECK(stale_output.empty());
     stale_output = "must be cleared";
-    CHECK(rack.call(kEchoPlugId, kEchoMethod, bytes_of(payload), &stale_output) != abi::ok);
+    CHECK(rack.call(kEchoPlugId, kEchoRequired, kEchoMethod, bytes_of(payload), &stale_output) != abi::ok);
+    CHECK(stale_output.empty());
+    abi::binding dead_binding{};
+    expect_status(rack.bind(first_credential, kEchoMethod, &dead_binding), abi::stale,
+                  "bind(returned credential)");
+    CHECK(dead_binding.value == 0);
 
     expect_ok(rack.load(paths.echo), "load(echo)");
     CHECK(has_plugin(rack.plugins(), kEchoPlugId));
@@ -831,8 +1055,14 @@ void integration_lifecycle(const fs::path& plugins_dir, const plugin_paths& path
                   "call(old binding) after reload");
     CHECK(stale_output.empty());
 
+    // The reloaded instance needs a fresh lease and a fresh binding: nothing about the old
+    // generation follows the plugin identity across a reload.
+    expect_ok(rack.acquire(kEchoPlugId, kEchoRequired, &revoker, &lease), "acquire(echo) after reload");
+    CHECK(lease.credential.value != 0);
+    CHECK(lease.credential.value != first_credential.value);
+    const abi::token second_credential = lease.credential;
     abi::binding new_binding{};
-    expect_ok(rack.bind(kEchoPlugId, kEchoMethodId, &new_binding), "bind(echo, id) after reload");
+    expect_ok(rack.bind(second_credential, kEchoMethodId, &new_binding), "bind(echo, id) after reload");
     CHECK(new_binding.value != 0);
     std::string rebound_output;
     expect_ok(rack.call(new_binding, bytes_of(payload), &rebound_output), "call(new binding)");
@@ -840,10 +1070,21 @@ void integration_lifecycle(const fs::path& plugins_dir, const plugin_paths& path
     expect_ok(rack.unbind(new_binding), "unbind(new binding)");
     CHECK(rack.call(new_binding, bytes_of(payload), &rebound_output) != abi::ok);
 
+    // release() drops the lease together with every binding that named it; a second release is
+    // stale, and an explicit release never counts as a revocation callback.
+    expect_ok(rack.release(second_credential), "release(new lease)");
+    expect_status(rack.release(second_credential), abi::stale, "release(returned lease)");
+    lease = abi::borrow{};
+    abi::binding after_release{};
+    expect_status(rack.bind(second_credential, kEchoMethod, &after_release), abi::stale,
+                  "bind(released credential)");
+    CHECK(after_release.value == 0);
+    CHECK(revoker.revocations == 1);
+
     expect_ok(rack.shutdown(), "shutdown()");
     CHECK(rack.plugins().empty());
     std::string shutdown_output = "must be cleared";
-    CHECK(rack.call(kEchoPlugId, kEchoMethod, bytes_of(payload), &shutdown_output) != abi::ok);
+    CHECK(rack.call(kEchoPlugId, kEchoRequired, kEchoMethod, bytes_of(payload), &shutdown_output) != abi::ok);
     CHECK(shutdown_output.empty());
 
     // Once the rack is shut down, the host rejects business calls uniformly before it
@@ -939,9 +1180,13 @@ void multi_round_checks(const fs::path& plugins_dir, const plugin_paths& paths, 
 int main(int argc, char** argv)
 {
     try {
-        if (argc < 4) {
+        // All four fixture paths are required. The legacy ABI v1 refusal is part of the
+        // contract, so a run without its DSO must fail loudly instead of reporting success
+        // while silently skipping the check. Extra arguments are ignored.
+        if (argc < 5) {
             std::fprintf(stderr,
-                         "usage: %s <plugins_dir> <bad_abi_library> <missing_entry_library>\n",
+                         "usage: %s <plugins_dir> <bad_abi_library> <missing_entry_library> "
+                         "<legacy_v1_library>\n",
                          argv[0]);
             return EXIT_FAILURE;
         }
@@ -954,7 +1199,12 @@ int main(int argc, char** argv)
         integration_lifecycle(plugins_dir, paths);
         multi_round_checks(plugins_dir, paths, 3);
 
-        std::fprintf(stdout, "integration_test: all checks passed\n");
+        // The ABI v1 refusal needs its own DSO, passed separately so it never reaches the v2
+        // scan of plugins_dir. The host coordinator's runargs pass it as the fourth path, so
+        // every standard invocation verifies the refusal rather than skipping it.
+        legacy_v1_checks(fs::path(argv[4]));
+
+        std::fprintf(stdout, "integration_test: all checks passed, legacy ABI v1 rejected\n");
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "integration_test: unexpected exception: %s\n", error.what());

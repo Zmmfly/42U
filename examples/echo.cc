@@ -1,15 +1,19 @@
 /**
  * @file echo.cc
- * @brief Example echo provider plugin: verbatim JSON echo plus a failing method.
+ * @brief Example echo provider plugin: verbatim JSON echo plus a deliberate failure method.
  *
  * @details
- * The library exports the frozen @c u42_get_factory entry point and owns a single
- * static factory. Created instances announce the example::echo_iid contract and the
- * optional dynamic-invoker interface, need no host implementation, and start no
- * threads, so init/start/stop stay trivial and synchronous.
+ * The library exports the frozen @c u42_get_factory entry point and owns a single static factory.
+ * An instance implements exactly two roles: iplug for the host lifecycle and iinvoke for
+ * host-dispatched methods. Both are host-private entries, so this provider publishes no business
+ * interface at all; a consumer reaches these methods only through the host gateway after
+ * acquiring a lease on example::echo_contract.
  *
- * @note The translation unit is built with -fvisibility=hidden; only the frozen
- *       entry symbol carries default visibility.
+ * The instance needs no host implementation, owns no threads and registers no callbacks, so
+ * init/start/stop stay trivial and synchronous.
+ *
+ * @note The translation unit is built with -fvisibility=hidden; only the frozen entry symbol
+ *       carries default visibility.
  */
 
 #include "echo.hpp"
@@ -35,28 +39,22 @@ constexpr std::uint32_t count_of(const element (&)[size]) noexcept
 /// @brief Canonical plugin identity announced to the host.
 constexpr char echo_plug_id[] = "com.example.echo";
 
-/// @brief Human-readable plugin version.
+/// @brief Human-readable plugin release version; the business protocol version is separate.
 constexpr char echo_version[] = "1.0.0";
 
-/// @brief Numeric identifier of the successful echo method.
-constexpr a::method_id echo_method_id = 1;
-
-/// @brief Numeric identifier of the deliberate partial-then-fail method.
-constexpr a::method_id fail_method_id = 2;
-
-/// @brief Published name of the successful echo method.
+/// @brief Published name of the verbatim echo method (number example::echo_method_id).
 constexpr char echo_method_name[] = "echo";
 
-/// @brief Human-readable summary of the successful echo method.
+/// @brief Human-readable summary of the verbatim echo method.
 constexpr char echo_method_description[] = "Return the request JSON bytes unchanged.";
 
-/// @brief Input schema of the successful echo method.
+/// @brief Input schema of the verbatim echo method.
 constexpr char echo_input_schema[] = "{\"type\":\"object\"}";
 
-/// @brief Output schema of the successful echo method.
+/// @brief Output schema of the verbatim echo method.
 constexpr char echo_output_schema[] = "{\"type\":\"object\"}";
 
-/// @brief Published name of the deliberate failure method.
+/// @brief Published name of the failure method (number example::fail_method_id).
 constexpr char fail_method_name[] = "fail";
 
 /// @brief Human-readable summary of the deliberate failure method.
@@ -68,14 +66,11 @@ constexpr char fail_input_schema[] = "{\"type\":\"object\"}";
 /// @brief Output schema of the deliberate failure method.
 constexpr char fail_output_schema[] = "{\"type\":\"object\"}";
 
-/// @brief Interfaces published through icaps::announce during start().
-const a::iid announced_interfaces[]{example::echo_iid, a::invoke_iid};
-
-/// @brief Methods published through icaps::announce during start().
+/// @brief Methods published with example::echo_contract through icaps::announce during start().
 const a::method_desc announced_methods[]{
-    {echo_method_id, echo_method_name, echo_method_description, echo_input_schema,
+    {example::echo_method_id, echo_method_name, echo_method_description, echo_input_schema,
      echo_output_schema},
-    {fail_method_id, fail_method_name, fail_method_description, fail_input_schema,
+    {example::fail_method_id, fail_method_name, fail_method_description, fail_input_schema,
      fail_output_schema},
 };
 
@@ -104,13 +99,13 @@ a::status append_bytes(a::iwriter* out, a::bytes data) noexcept
 }
 
 /**
- * @brief Provider instance implementing the echo contract and the optional invoker.
+ * @brief Provider instance serving the host lifecycle and host-dispatched method calls.
  *
- * @note All calls arrive on the single host control thread; the instance is created
- *       by the factory, initialized once, started once and finally destroyed through
- *       destroy(), which performs the deletion on the allocating side.
+ * @note All calls arrive on the single host control thread; the instance is created by the
+ *       factory, initialized once, started once and finally destroyed through destroy(), which
+ *       performs the deletion on the allocating side.
  */
-class echo_plugin final : public a::iplug, public a::iinvoke, public example::iecho {
+class echo_plugin final : public a::iplug, public a::iinvoke {
 public:
     echo_plugin() = default;
     echo_plugin(const echo_plugin&) = delete;
@@ -124,7 +119,6 @@ public:
 
     a::status U42_CALL invoke(a::method_id method, a::bytes args,
                               a::iwriter* result) noexcept override;
-    a::status U42_CALL echo(a::bytes input, a::iwriter* out) noexcept override;
 
 private:
     /**
@@ -132,12 +126,12 @@ private:
      *
      * @param out Caller-owned writer receiving the partial bytes.
      * @retval invalid_argument The writer was null.
-     * @retval failed Always, after the partial prefix was accepted, so a host can
-     *         verify that partial output is discarded atomically.
+     * @retval failed Always, after the partial prefix was accepted, so a host can verify that
+     *         partial output is discarded atomically.
      */
     a::status write_partial_then_fail(a::iwriter* out) noexcept;
 
-    /// @brief Capability service borrowed during init; valid until destroy.
+    /// @brief Capability service borrowed during init; valid until destroy returns.
     a::icaps* caps_ = nullptr;
 
     /// @brief Guards icaps::announce against a second start().
@@ -170,7 +164,7 @@ a::status U42_CALL echo_plugin::init(a::ictx* ctx) noexcept
 }
 
 /**
- * @brief Publish the interface set and the two synchronous methods.
+ * @brief Publish example::echo_contract together with its two synchronous methods.
  *
  * @retval ok The complete capability set was announced.
  * @retval invalid_state The instance was not initialized or was already started.
@@ -182,8 +176,8 @@ a::status U42_CALL echo_plugin::start() noexcept
     if (announced_) return a::invalid_state;
     try {
         const a::caps_desc capabilities{static_cast<std::uint32_t>(sizeof(a::caps_desc)),
-                                        count_of(announced_interfaces), announced_interfaces,
-                                        count_of(announced_methods), announced_methods};
+                                        count_of(announced_methods), announced_methods,
+                                        example::echo_contract};
         const a::status status = caps_->announce(&capabilities);
         if (status != a::ok) return status;
     } catch (...) {
@@ -197,6 +191,8 @@ a::status U42_CALL echo_plugin::start() noexcept
  * @brief Retire the announced capability set.
  *
  * @return ok; the provider owns no threads, callbacks or leases to unwind.
+ * @note Outstanding consumer leases are revoked by the host before this point; the provider keeps
+ *       serving iinvoke until its own teardown.
  */
 a::status U42_CALL echo_plugin::stop() noexcept
 {
@@ -213,23 +209,20 @@ void U42_CALL echo_plugin::destroy() noexcept
 }
 
 /**
- * @brief Return a borrowed interface pointer for a known identifier.
+ * @brief Return the host-private dynamic invoker for the invoke_iid.
  *
  * @param type Requested interface identifier.
  * @param out Cleared on entry; receives the borrowed pointer on success.
- * @retval ok The identifier is served by this instance.
+ * @retval ok The identifier is invoke_iid.
  * @retval invalid_argument The output pointer or identifier was null.
- * @retval unsupported The identifier is unknown to this instance.
+ * @retval unsupported The identifier is unknown, including any business identifier: this provider
+ *         never answers a cross-plugin business query.
  */
 a::status U42_CALL echo_plugin::query(const a::iid* type, void** out) noexcept
 {
     if (out == nullptr) return a::invalid_argument;
     *out = nullptr;
     if (type == nullptr) return a::invalid_argument;
-    if (*type == example::echo_iid) {
-        *out = static_cast<example::iecho*>(this);
-        return a::ok;
-    }
     if (*type == a::invoke_iid) {
         *out = static_cast<a::iinvoke*>(this);
         return a::ok;
@@ -243,8 +236,8 @@ a::status U42_CALL echo_plugin::query(const a::iid* type, void** out) noexcept
  * @param method Published numeric method identifier.
  * @param args Borrowed request bytes forwarded to the echo method.
  * @param result Caller-owned output writer.
- * @retval ok The echo method succeeded.
- * @retval invalid_argument A required argument was null.
+ * @retval ok The verbatim echo method succeeded.
+ * @retval invalid_argument A required argument was null or inconsistent.
  * @retval not_found The identifier is not a published method.
  * @retval failed The deliberate failure method ran, or a foreign exception escaped.
  */
@@ -252,27 +245,13 @@ a::status U42_CALL echo_plugin::invoke(a::method_id method, a::bytes args,
                                        a::iwriter* result) noexcept
 {
     switch (method) {
-    case echo_method_id:
-        return echo(args, result);
-    case fail_method_id:
+    case example::echo_method_id:
+        return append_bytes(result, args);
+    case example::fail_method_id:
         return write_partial_then_fail(result);
     default:
         return a::not_found;
     }
-}
-
-/**
- * @brief Copy the request bytes to the writer without parsing them.
- *
- * @param input Borrowed request bytes.
- * @param out Caller-owned output writer.
- * @retval ok The whole payload was accepted.
- * @retval invalid_argument A required argument was null or inconsistent.
- * @retval failed The writer threw a foreign exception across the ABI.
- */
-a::status U42_CALL echo_plugin::echo(a::bytes input, a::iwriter* out) noexcept
-{
-    return append_bytes(out, input);
 }
 
 /**
@@ -295,8 +274,8 @@ a::status echo_plugin::write_partial_then_fail(a::iwriter* out) noexcept
 /**
  * @brief Library-owned factory returning metadata and fresh instances.
  *
- * @note describe() performs no work beyond handing out immutable metadata, and
- *       create() returns an uninitialized, silent instance.
+ * @note describe() performs no work beyond handing out immutable metadata, and create() returns an
+ *       uninitialized, silent instance.
  */
 class echo_factory final : public a::iplug_fty {
 public:

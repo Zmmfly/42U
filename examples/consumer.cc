@@ -1,22 +1,39 @@
 /**
  * @file consumer.cc
- * @brief Example consumer plugin: observe, borrow, use and revoke a provider lease.
+ * @brief Example consumer plugin: watch, lease, invoke through the host, survive revocation.
  *
  * @details
- * The consumer runs entirely on the host control thread. During init it acquires
- * the capability, call and event services, then atomically watches capability
- * changes and subscribes to @c demo.tick. Availability may arrive while the plugin
- * is still only Initialized, so a lease is acquired there but business methods are
- * called only while Active. Withdrawals never drop the outstanding credential; the
- * credential is returned in on_revoke, and a fresh lease is acquired afterwards.
- * The plugin also publishes a dynamic @c status method through iinvoke and
- * demonstrates the generic icalls binding path.
+ * The consumer runs entirely on the host control thread and never stores a provider address or
+ * interface pointer. It watches capability changes, accepts an offer only when
+ * compatible_contract(offered, example::echo_contract) held for that exact notification, and then
+ * acquires a pointerless lease credential for that required contract. Every business call travels
+ * consumer -> host icalls -> provider iinvoke:
+ * bind_name(credential, "echo") -> call(binding) -> unbind(binding).
  *
- * @note The translation unit is built with -fvisibility=hidden and requires no host
- *       implementation to compile or link.
+ * A revocation closes business and forgets the binding first, then returns the credential; a
+ * refusal keeps the credential in the lease so a later notification or stop() can retry it, and
+ * only ok/stale clear it. A reloaded provider is always re-validated and re-leased from scratch:
+ * an old credential and its bindings are never followed into a new generation.
+ *
+ * Binding and invoking are deliberately separate phases. Creating a binding is not business work
+ * and the host admits it from Initialized onwards, which matters because compatible capability
+ * notifications are dispatched between start() calls - often while this instance is still only
+ * Initialized. Invoking is business work and stays gated on this instance being Active, because
+ * the host admits no new work while it is still starting an owner. start() therefore only flips
+ * the Active flag and never requests a binding: at that moment the owner is still phase::starting,
+ * so a bind attempted there would be refused and, without a later notification, business would
+ * never open.
+ *
+ * The plugin also publishes example::consumer_contract with a dynamic status method through
+ * iinvoke, which reports the counters demonstrated here.
+ *
+ * @note The translation unit is built with -fvisibility=hidden. The consumer links no host
+ *       implementation: it only needs the frozen ABI and the header-only SDK wrappers.
  */
 
 #include "echo.hpp"
+
+#include <42u/sdk.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -41,22 +58,19 @@ constexpr std::uint32_t count_of(const element (&)[size]) noexcept
 /// @brief Canonical plugin identity announced to the host.
 constexpr char consumer_plug_id[] = "com.example.consumer";
 
-/// @brief Human-readable plugin version.
+/// @brief Human-readable plugin release version; the business protocol version is separate.
 constexpr char consumer_version[] = "1.0.0";
 
-/// @brief Identity of the provider this consumer depends on.
+/// @brief Identity of the only provider this consumer depends on.
 constexpr char echo_plug_id[] = "com.example.echo";
 
-/// @brief Published name of the periodic demonstration event.
+/// @brief Published name of the periodic demonstration event this consumer subscribes to.
 constexpr char tick_event_name[] = "demo.tick";
 
-/// @brief Published name of the provider method invoked generically.
+/// @brief Method name bound through icalls under the echo lease.
 constexpr char echo_method_name[] = "echo";
 
-/// @brief Numeric identifier of the consumer status method.
-constexpr a::method_id status_method_id = 1;
-
-/// @brief Published name of the consumer status method.
+/// @brief Published name of the consumer status method (number example::status_method_id).
 constexpr char status_method_name[] = "status";
 
 /// @brief Human-readable summary of the consumer status method.
@@ -71,12 +85,9 @@ constexpr char status_output_schema[] = "{\"type\":\"object\"}";
 /// @brief Hard initialization edge: the echo provider must precede this plugin.
 const char* const consumer_after[]{echo_plug_id};
 
-/// @brief Interfaces published through icaps::announce during start().
-const a::iid consumer_interfaces[]{a::invoke_iid};
-
-/// @brief Methods published through icaps::announce during start().
+/// @brief Methods published with example::consumer_contract through icaps::announce.
 const a::method_desc consumer_methods[]{
-    {status_method_id, status_method_name, status_method_description, status_input_schema,
+    {example::status_method_id, status_method_name, status_method_description, status_input_schema,
      status_output_schema},
 };
 
@@ -85,73 +96,14 @@ const a::plug_desc consumer_plug_description{
     static_cast<std::uint32_t>(sizeof(a::plug_desc)), 0u, consumer_plug_id, consumer_version, 10,
     0u, nullptr, count_of(consumer_after), consumer_after};
 
-/**
- * @brief Bounded, discarding output sink used to demonstrate synchronous calls.
- *
- * @note The consumer never inspects echoed bytes; it only proves that the typed and
- *       generic invocation paths complete within a bounded buffer.
- */
-class scratch_writer final : public a::iwriter {
-public:
-    /**
-     * @brief Construct a sink with a fixed accepted-byte budget.
-     *
-     * @param limit Maximum number of bytes this sink will accept.
-     */
-    explicit scratch_writer(std::size_t limit) noexcept : limit_(limit) {}
-
-    /**
-     * @brief Account for one written slice without retaining it.
-     *
-     * @param data Borrowed bytes to count.
-     * @retval ok The bytes fit within the budget.
-     * @retval invalid_argument The slice was null with a non-zero size.
-     * @retval limit_exceeded The slice would overflow the budget.
-     */
-    a::status U42_CALL write(a::bytes data) noexcept override
-    {
-        if (data.data == nullptr && data.size != 0u) return a::invalid_argument;
-        if (data.size > limit_ - accepted_) return a::limit_exceeded;
-        accepted_ += static_cast<std::size_t>(data.size);
-        return a::ok;
-    }
-
-private:
-    /// @brief Maximum number of bytes accepted over the writer lifetime.
-    std::size_t limit_;
-
-    /// @brief Number of bytes accepted so far; never exceeds limit_.
-    std::size_t accepted_ = 0;
-};
-
-/**
- * @brief Query one host service interface and reject a null result.
- *
- * @tparam interface_type Exact ABI service type expected for the identifier.
- * @param ctx Host context borrowed from the init entry.
- * @param type Frozen service interface identifier.
- * @param out Cleared first; receives the borrowed service pointer on success.
- * @retval ok The service was found and is non-null.
- * @retval failed The host reported success but returned a null pointer.
- * @retval others The propagated host query status.
- */
-template <typename interface_type>
-a::status resolve_service(a::ictx* ctx, const a::iid& type, interface_type*& out) noexcept
-{
-    out = nullptr;
-    void* raw = nullptr;
-    const a::status status = ctx->query(&type, &raw);
-    if (status != a::ok) return status;
-    if (raw == nullptr) return a::failed;
-    out = static_cast<interface_type*>(raw);
-    return a::ok;
-}
+/// @brief Maximum bytes accepted from one echoed provider result.
+constexpr std::size_t echo_result_limit = 4096;
 
 /**
  * @brief Consumer instance implementing the plugin, sink, revoker and invoker roles.
  *
- * @note Callbacks and methods all run on the control thread; the instance never
- *       publishes on its own and never creates threads.
+ * @note Callbacks and methods all run on the control thread; the instance never publishes on its
+ *       own and never creates threads.
  */
 class consumer_plugin final : public a::iplug,
                               public a::ievent_sink,
@@ -178,27 +130,39 @@ public:
 
 private:
     /**
-     * @brief Acquire the echo lease unless one is already outstanding.
+     * @brief Stop using the current binding and forget it.
      *
-     * @note The withdrawal path keeps the current credential, so a new lease is
-     *       requested only after on_revoke returned the previous one.
+     * @note The credential is untouched: closing business is independent of returning the lease,
+     *       so a revocation can drop the binding before icaps::release() is attempted. unbind() may
+     *       legitimately report stale for a lease the host already revoked.
+     */
+    void close_business() noexcept;
+
+    /**
+     * @brief Bind the echo method under the current lease as soon as binding is permitted.
+     *
+     * @note Binding is not a business call and needs no Active instance, so this may run for a
+     *       notification that arrived while Initialized as well as for runtime availability;
+     *       invoking remains gated on active_ in on_event(). Safe to call repeatedly: without an
+     *       initialized instance, without a lease, without the calls service or while already
+     *       connected it does nothing.
+     */
+    void open_business() noexcept;
+
+    /**
+     * @brief Acquire a fresh lease unless one is already held.
+     *
+     * @note Called only for an offer accepted by compatible_contract(); see on_capability().
      */
     void acquire_echo() noexcept;
 
-    /**
-     * @brief Invoke the provider through the generic icalls binding path.
-     *
-     * @param payload Borrowed request bytes echoed verbatim by the provider.
-     */
-    void invoke_echo_by_name(a::bytes payload) noexcept;
-
-    /// @brief Capability service borrowed during init; valid until destroy.
+    /// @brief Capability service borrowed during init; valid until destroy returns.
     a::icaps* caps_ = nullptr;
 
-    /// @brief Call registry borrowed during init; valid until destroy.
+    /// @brief Call registry borrowed during init; valid until destroy returns.
     a::icalls* calls_ = nullptr;
 
-    /// @brief Event service borrowed during init; valid until destroy.
+    /// @brief Event service borrowed during init; valid until destroy returns.
     a::ievents* events_ = nullptr;
 
     /// @brief Capability watch token owned by this instance.
@@ -207,20 +171,20 @@ private:
     /// @brief Event subscription token owned by this instance.
     a::token subscription_token_{};
 
-    /// @brief Outstanding lease credential; zero means no lease is held.
-    a::token lease_token_{};
+    /// @brief Pointerless lease on one echo generation; empty while no credential is held.
+    u42::sdk::lease echo_lease_{};
 
-    /// @brief Cached typed lease target; cleared in on_revoke and stop.
-    example::iecho* echo_ = nullptr;
-
-    /// @brief Whether business calls on the current lease are permitted.
-    bool echo_available_ = false;
+    /// @brief Binding created from echo_lease_'s credential; empty while business is closed.
+    a::binding echo_binding_{};
 
     /// @brief Whether init completed successfully.
     bool initialized_ = false;
 
     /// @brief Whether start completed and the plugin is Active.
     bool active_ = false;
+
+    /// @brief Whether the current lease has a live binding; only a successful bind sets it.
+    bool connected_ = false;
 
     /// @brief Number of matching revocations observed.
     std::uint64_t revocation_count_ = 0;
@@ -236,18 +200,20 @@ private:
  * @retval ok Services were acquired and the watch and subscription registered.
  * @retval invalid_argument The context was null.
  * @retval invalid_state The instance was already initialized.
- * @retval others The propagated host status; partial registrations are rolled back.
+ * @retval others The propagated host status; the watch is rolled back if the subscription fails.
+ * @note No lease is acquired here: only an accepted capability notification may do that, and the
+ *       notification may arrive while this instance is still Initialized.
  */
 a::status U42_CALL consumer_plugin::init(a::ictx* ctx) noexcept
 {
     if (ctx == nullptr) return a::invalid_argument;
     if (initialized_) return a::invalid_state;
     try {
-        a::status status = resolve_service(ctx, a::caps_iid, caps_);
+        a::status status = u42::sdk::query(ctx, a::caps_iid, &caps_);
         if (status != a::ok) return status;
-        status = resolve_service(ctx, a::calls_iid, calls_);
+        status = u42::sdk::query(ctx, a::calls_iid, &calls_);
         if (status != a::ok) return status;
-        status = resolve_service(ctx, a::events_iid, events_);
+        status = u42::sdk::query(ctx, a::events_iid, &events_);
         if (status != a::ok) return status;
         status = caps_->watch(this, &watch_token_);
         if (status != a::ok) return status;
@@ -265,11 +231,16 @@ a::status U42_CALL consumer_plugin::init(a::ictx* ctx) noexcept
 }
 
 /**
- * @brief Publish the dynamic status method and enter the Active phase.
+ * @brief Publish the consumer contract and enter the Active phase.
  *
  * @retval ok The capability set was announced and the plugin is Active.
  * @retval invalid_state The instance was not initialized or was already started.
  * @retval others The propagated announce status.
+ * @note This creates no binding on purpose. While start() runs the host still tracks this owner as
+ *       starting and admits new work only from Initialized/Active, so a bind here would fail and
+ *       nothing would retry it. A compatible notification has normally leased the provider and
+ *       bound the method already, while this instance was Initialized; that existing binding just
+ *       becomes usable because invoking is gated on active_.
  */
 a::status U42_CALL consumer_plugin::start() noexcept
 {
@@ -277,8 +248,8 @@ a::status U42_CALL consumer_plugin::start() noexcept
     if (active_) return a::invalid_state;
     try {
         const a::caps_desc capabilities{static_cast<std::uint32_t>(sizeof(a::caps_desc)),
-                                        count_of(consumer_interfaces), consumer_interfaces,
-                                        count_of(consumer_methods), consumer_methods};
+                                        count_of(consumer_methods), consumer_methods,
+                                        example::consumer_contract};
         const a::status status = caps_->announce(&capabilities);
         if (status != a::ok) return status;
     } catch (...) {
@@ -289,39 +260,45 @@ a::status U42_CALL consumer_plugin::start() noexcept
 }
 
 /**
- * @brief Remove the subscription and watch, then return any outstanding lease.
+ * @brief Close business, remove both registrations and return the lease.
  *
- * @return ok; all private registrations and leases owned by this instance ended.
+ * @return ok only when every owned registration and the lease were released.
+ * @note A failing removal or a refused icaps::release() is reported instead of being hidden, and
+ *       the affected token stays owned rather than silently abandoning a tracked dependency.
+ *       A failing stop() makes the host quarantine this instance; the host does not retry stop().
  */
 a::status U42_CALL consumer_plugin::stop() noexcept
 {
     active_ = false;
-    echo_available_ = false;
+    close_business();
+    a::status failure = a::ok;
     if (events_ != nullptr && subscription_token_.value != 0u) {
+        a::status status = a::failed;
         try {
-            (void)events_->unsubscribe(subscription_token_);
+            status = events_->unsubscribe(subscription_token_);
         } catch (...) {
         }
-        subscription_token_ = {};
+        if (status == a::ok || status == a::stale || status == a::not_found) {
+            subscription_token_ = {};
+        } else if (failure == a::ok) {
+            failure = status;
+        }
     }
     if (caps_ != nullptr && watch_token_.value != 0u) {
+        a::status status = a::failed;
         try {
-            (void)caps_->unwatch(watch_token_);
+            status = caps_->unwatch(watch_token_);
         } catch (...) {
         }
-        watch_token_ = {};
-    }
-    if (caps_ != nullptr && lease_token_.value != 0u) {
-        const a::token returning = lease_token_;
-        lease_token_ = {};
-        echo_ = nullptr;
-        try {
-            (void)caps_->release(returning);
-        } catch (...) {
+        if (status == a::ok || status == a::stale || status == a::not_found) {
+            watch_token_ = {};
+        } else if (failure == a::ok) {
+            failure = status;
         }
     }
-    echo_ = nullptr;
-    return a::ok;
+    const a::status returned = echo_lease_.reset();
+    if (returned != a::ok && returned != a::stale && failure == a::ok) failure = returned;
+    return failure;
 }
 
 /**
@@ -333,11 +310,11 @@ void U42_CALL consumer_plugin::destroy() noexcept
 }
 
 /**
- * @brief Return the borrowed dynamic-invoker interface for the status method.
+ * @brief Return the host-private dynamic invoker for the status method.
  *
  * @param type Requested interface identifier.
  * @param out Cleared on entry; receives the borrowed pointer on success.
- * @retval ok The identifier is served by this instance.
+ * @retval ok The identifier is invoke_iid.
  * @retval invalid_argument The output pointer or identifier was null.
  * @retval unsupported The identifier is unknown to this instance.
  */
@@ -354,73 +331,84 @@ a::status U42_CALL consumer_plugin::query(const a::iid* type, void** out) noexce
 }
 
 /**
- * @brief Handle one queued event, using the lease only while Active.
+ * @brief Serve one queued event through the host call gateway.
  *
  * @param value Borrowed event view; valid only during this call.
  *
- * @note @c demo.tick increments the event counter; the echoed call happens only when
- *       the plugin is Active and a usable lease is held, never during Initialized.
+ * @note @c demo.tick increments the event counter; the echoed call happens only while the plugin
+ *       is Active and the current lease has a live binding. An event delivered while Initialized
+ *       only counts, because a binding is not permission to invoke. The provider result is bounded
+ *       and discarded: this example proves the call completed, not what it returned.
  */
 void U42_CALL consumer_plugin::on_event(const a::event* value) noexcept
 {
     if (value == nullptr || value->name == nullptr) return;
     if (std::strcmp(value->name, tick_event_name) != 0) return;
     ++event_count_;
-    if (!active_ || !echo_available_ || echo_ == nullptr) return;
+    if (!active_ || !connected_ || echo_binding_.value == 0u || calls_ == nullptr) return;
     try {
-        scratch_writer typed_sink(4096);
-        (void)echo_->echo(value->payload, &typed_sink);
-        invoke_echo_by_name(value->payload);
+        std::string discarded;
+        u42::sdk::string_writer sink(&discarded, echo_result_limit);
+        (void)calls_->call(echo_binding_, value->payload, &sink);
     } catch (...) {
     }
 }
 
 /**
- * @brief Track provider availability without losing an outstanding credential.
+ * @brief Accept an offer only under the protocol this consumer requires.
  *
  * @param value Borrowed capability view; valid only during this call.
  *
- * @note Availability delivered while Initialized acquires a lease but performs no
- *       business call. A withdrawal marks the lease unusable while keeping both the
- *       pointer and the credential, because on_revoke must still return them.
+ * @note An offer whose protocol fails compatible_contract(offered, example::echo_contract) never
+ *       opens business; a withdrawal stops using the binding while keeping the credential for
+ *       irevoker::on_revoke(). A compatible offer is leased and bound immediately, which is legal
+ *       while this instance is only Initialized because binding is not business work; invoking
+ *       still waits for start(). A live credential is never re-borrowed, so this only binds the
+ *       method again for an availability notice that arrives with an outstanding lease.
  */
 void U42_CALL consumer_plugin::on_capability(const a::cap_event* value) noexcept
 {
     if (value == nullptr || value->plug_id == nullptr) return;
     if (std::strcmp(value->plug_id, echo_plug_id) != 0) return;
     try {
-        if (value->available != 0u) {
-            acquire_echo();
-        } else {
-            echo_available_ = false;
+        if (value->available == 0u) {
+            // Withdrawal forbids new business but keeps the credential for irevoker::on_revoke().
+            close_business();
+            return;
         }
+        if (!a::compatible_contract(value->capabilities.protocol, example::echo_contract)) {
+            // An offer this consumer does not accept must not open business. A credential granted
+            // earlier was accepted for the required contract, so it is returned rather than reused
+            // against a provider that no longer publishes what this consumer requires.
+            close_business();
+            (void)echo_lease_.reset();
+            return;
+        }
+        if (echo_lease_) {
+            open_business();
+            if (echo_lease_) return; // A still-live credential is never re-borrowed.
+        }
+        acquire_echo();
     } catch (...) {
     }
 }
 
 /**
- * @brief Return a matching lease and clear the cached pointer.
+ * @brief Stop business and return the revoked credential.
  *
  * @param credential Host credential being revoked.
  *
- * @note Only a credential matching the current lease is acted upon; the pointer is
- *       cleared first, the lease is returned through icaps::release, and the
- *       revocation counter is incremented exactly once per match.
+ * @note An unrelated or already returned credential is ignored. The binding is dropped before the
+ *       return is attempted, and a refused return keeps the credential in the lease so a later
+ *       callback or stop() can retry it; a reloaded provider is then leased and bound anew instead
+ *       of reusing any old token.
  */
 void U42_CALL consumer_plugin::on_revoke(a::token credential) noexcept
 {
-    if (credential.value == 0u || credential.value != lease_token_.value) return;
-    echo_ = nullptr;
-    echo_available_ = false;
-    const a::token returning = lease_token_;
-    lease_token_ = {};
+    if (!echo_lease_.matches(credential)) return;
+    close_business();
     ++revocation_count_;
-    if (caps_ != nullptr) {
-        try {
-            (void)caps_->release(returning);
-        } catch (...) {
-        }
-    }
+    (void)echo_lease_.reset();
 }
 
 /**
@@ -438,67 +426,92 @@ a::status U42_CALL consumer_plugin::invoke(a::method_id method, a::bytes args,
                                            a::iwriter* result) noexcept
 {
     (void)args;
-    if (method != status_method_id) return a::not_found;
+    if (method != example::status_method_id) return a::not_found;
     if (result == nullptr) return a::invalid_argument;
     try {
-        const bool connected = echo_available_ && echo_ != nullptr;
         std::string payload = "{\"connected\":";
-        payload += connected ? "true" : "false";
+        payload += connected_ ? "true" : "false";
         payload += ",\"revocations\":";
         payload += std::to_string(revocation_count_);
         payload += ",\"events\":";
         payload += std::to_string(event_count_);
         payload += "}";
-        return result->write(a::bytes{payload.data(), payload.size()});
+        return result->write(u42::sdk::view(payload));
     } catch (...) {
         return a::failed;
     }
 }
 
 /**
- * @brief Acquire the echo lease unless one is already outstanding.
+ * @brief Stop using the current binding and forget it.
  */
-void consumer_plugin::acquire_echo() noexcept
+void consumer_plugin::close_business() noexcept
 {
-    if (caps_ == nullptr) return;
-    if (lease_token_.value != 0u) return;
-    a::borrow borrowed{};
-    const a::status status = caps_->acquire(echo_plug_id, &example::echo_iid, this, &borrowed);
-    if (status != a::ok) return;
-    if (borrowed.ptr == nullptr || borrowed.credential.value == 0u) {
-        if (borrowed.credential.value != 0u) {
-            try {
-                (void)caps_->release(borrowed.credential);
-            } catch (...) {
-            }
+    connected_ = false;
+    if (calls_ != nullptr && echo_binding_.value != 0u) {
+        try {
+            // ok and stale both mean this binding is gone; a revoked lease may already be stale.
+            (void)calls_->unbind(echo_binding_);
+        } catch (...) {
         }
-        return;
     }
-    echo_ = static_cast<example::iecho*>(borrowed.ptr);
-    lease_token_ = borrowed.credential;
-    echo_available_ = true;
+    echo_binding_ = {};
 }
 
 /**
- * @brief Invoke the provider through the generic icalls binding path.
+ * @brief Bind the echo method under the current lease as soon as binding is permitted.
  *
- * @param payload Borrowed request bytes echoed verbatim by the provider.
+ * @note The host admits binding from Initialized onwards, so this runs for a notification that
+ *       arrived before start() as well as for later availability. Invoking is not implied: on_event
+ *       still requires active_. A failed bind leaves connected_ false instead of claiming a usable
+ *       session, and only an actually dead credential (stale, which release also reports as ok) is
+ *       dropped so that a later compatible offer can lease the replacement generation.
  */
-void consumer_plugin::invoke_echo_by_name(a::bytes payload) noexcept
+void consumer_plugin::open_business() noexcept
 {
-    if (calls_ == nullptr) return;
+    if (connected_ || !initialized_ || calls_ == nullptr || !echo_lease_) return;
     a::binding target{};
-    if (calls_->bind_name(echo_plug_id, echo_method_name, &target) != a::ok) return;
-    scratch_writer generic_sink(4096);
-    (void)calls_->call(target, payload, &generic_sink);
-    (void)calls_->unbind(target);
+    a::status status = a::failed;
+    try {
+        status = calls_->bind_name(echo_lease_.credential(), echo_method_name, &target);
+    } catch (...) {
+        return;
+    }
+    if (status == a::stale) {
+        // The host already considers this credential returned; ok/stale are the only statuses that
+        // may drop it, and dropping it lets the next offer lease a fresh generation.
+        (void)echo_lease_.reset();
+        return;
+    }
+    if (status != a::ok || target.value == 0u) return;
+    echo_binding_ = target;
+    connected_ = true;
+}
+
+/**
+ * @brief Acquire a fresh lease unless one is already held, then bind under it.
+ *
+ * @note Called only for an offer accepted by compatible_contract(); see on_capability().
+ */
+void consumer_plugin::acquire_echo() noexcept
+{
+    if (caps_ == nullptr || echo_lease_) return;
+    a::borrow borrowed{};
+    try {
+        if (caps_->acquire(echo_plug_id, &example::echo_contract, this, &borrowed) != a::ok) return;
+    } catch (...) {
+        return;
+    }
+    if (borrowed.credential.value == 0u) return;
+    echo_lease_ = u42::sdk::lease(caps_, borrowed);
+    open_business();
 }
 
 /**
  * @brief Library-owned factory returning metadata and fresh instances.
  *
- * @note describe() performs no work beyond handing out immutable metadata, and
- *       create() returns an uninitialized, silent instance.
+ * @note describe() performs no work beyond handing out immutable metadata, and create() returns an
+ *       uninitialized, silent instance.
  */
 class consumer_factory final : public a::iplug_fty {
 public:

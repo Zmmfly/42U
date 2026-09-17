@@ -26,7 +26,7 @@ namespace sdk {
  *           void*, so the caller must name the same type the host published for this iid.
  *
  * @param ctx Borrowed host context. A null context is rejected without being dereferenced.
- * @param type Frozen service interface identifier, e.g. abi::v1::caps_iid or abi::v1::calls_iid.
+ * @param type Frozen service interface identifier, e.g. abi::v2::caps_iid or abi::v2::calls_iid.
  * @param out Receives the borrowed interface. It is cleared before the context is touched and
  *            remains null on every failure; a null out is rejected, because otherwise a failed
  *            query could not be reported anywhere.
@@ -40,14 +40,14 @@ namespace sdk {
  *       fabricated one.
  */
 template <class T>
-abi::v1::status query(abi::v1::ictx* ctx, abi::v1::iid type, T** out) noexcept
+abi::v2::status query(abi::v2::ictx* ctx, abi::v2::iid type, T** out) noexcept
 {
-    if (out == nullptr) return abi::v1::invalid_argument;
+    if (out == nullptr) return abi::v2::invalid_argument;
     *out = nullptr;
-    if (ctx == nullptr) return abi::v1::invalid_argument;
+    if (ctx == nullptr) return abi::v2::invalid_argument;
     void* raw = nullptr;
-    const abi::v1::status status = ctx->query(&type, &raw);
-    if (status != abi::v1::ok) return status;
+    const abi::v2::status status = ctx->query(&type, &raw);
+    if (status != abi::v2::ok) return status;
     *out = static_cast<T*>(raw);
     return status;
 }
@@ -63,41 +63,44 @@ abi::v1::status query(abi::v1::ictx* ctx, abi::v1::iid type, T** out) noexcept
  *       underlying characters stay alive and unmodified, so never return it from a function
  *       that owns the string and never retain it after the call.
  */
-inline abi::v1::bytes view(std::string_view text) noexcept
+inline abi::v2::bytes view(std::string_view text) noexcept
 {
-    if (text.empty()) return abi::v1::bytes{nullptr, 0};
-    return abi::v1::bytes{text.data(), static_cast<std::uint64_t>(text.size())};
+    if (text.empty()) return abi::v2::bytes{nullptr, 0};
+    return abi::v2::bytes{text.data(), static_cast<std::uint64_t>(text.size())};
 }
 
 /**
  * @brief Move-only RAII holder for one icaps::acquire() borrow.
  *
- * @tparam T Interface type advertised for the acquired identifier. The lease stores the ABI's
- *           void* verbatim and converts it only in get()/operator->, so T must be the type that
- *           matches the acquired iid.
+ * A lease owns exactly one revocation credential and nothing else. The ABI value it holds
+ * (abi::v2::borrow) is a single opaque token, so the class deliberately exposes no get(), no
+ * operator-> and no interface pointer at all: the only way to reach business functionality is to
+ * pass credential() to icalls::bind_name()/bind_id(). That keeps the plugin-to-plugin path
+ * consumer -> host icalls -> provider iinvoke and makes it impossible for a lease to smuggle a
+ * provider address across the boundary.
  *
- * A lease owns exactly one revocation credential and tries to return it through icaps::release().
- * Ownership is dropped only when the host actually accepted the return (ok, or stale for a
- * credential that a later acquire already superseded); a retryable refusal such as busy,
- * wrong_thread or failed keeps the pointer and the credential in place so the control thread can
- * retry, and a moved-from lease holds neither, so ownership transfers without any possibility of
- * a second release. reset() is therefore idempotent and never throws.
+ * The credential is returned through icaps::release(). Ownership is dropped only when the host
+ * actually accepted the return (ok, or stale for a credential that a later acquire already
+ * superseded); a retryable refusal such as busy, wrong_thread or failed keeps the credential in
+ * place so the control thread can retry, and a moved-from lease holds nothing, so ownership
+ * transfers without any possibility of a second release. reset() is therefore idempotent and never
+ * throws.
  *
  * @note Source-level only: this wrapper is never passed across the ABI - not as a parameter of a
  *       virtual function and not inside an ABI-visible struct. Only icaps::acquire()/release()
  *       and the raw borrow cross the boundary.
  *
  * @warning Never make the lease itself, or any class deriving from it, the irevoker handed to
- *          icaps::acquire(). Moving a lease copies a pointer, so the host would keep revoking
- *          into the address it saw at acquire() time - the moved-from or destroyed object - and
- *          a later irevoker::on_revoke() would be a use-after-free. Register a stable owner
- *          object as the irevoker instead and, from its on_revoke(), call lease.reset() only
- *          when lease.matches(credential) is true; tests/sdk_test.cc pins exactly that flow.
+ *          icaps::acquire(). Moving a lease transfers the credential but not the callback address,
+ *          so the host would keep revoking into the address it saw at acquire() time - the
+ *          moved-from or destroyed object - and a later irevoker::on_revoke() would be a
+ *          use-after-free. Register a stable owner object as the irevoker instead and, from its
+ *          on_revoke(), call lease.reset() only when lease.matches(credential) is true;
+ *          tests/sdk_test.cc pins exactly that flow.
  */
-template <class T>
 class lease {
 public:
-    /** @brief Construct an empty lease that owns no interface and no credential. */
+    /** @brief Construct an empty lease that owns no credential. */
     lease() noexcept = default;
 
     /**
@@ -105,11 +108,12 @@ public:
      *
      * @param caps Owning capability service used to return the credential; borrowed, not owned.
      *             A null value makes the credential unreturnable: reset() then reports
-     *             invalid_state and keeps the borrow, so only construct a lease with the icaps
-     *             that actually issued the borrow.
-     * @param value Borrow returned by icaps::acquire(); an empty borrow means "owns nothing".
+     *             invalid_state and keeps it, so only construct a lease with the icaps that
+     *             actually issued the borrow.
+     * @param value Borrow returned by icaps::acquire(); only its credential is stored, and a zero
+     *              credential means "owns nothing".
      */
-    lease(abi::v1::icaps* caps, abi::v1::borrow value) noexcept : caps_(caps), value_(value) {}
+    lease(abi::v2::icaps* caps, abi::v2::borrow value) noexcept : caps_(caps), value_(value) {}
 
     /** @brief A borrow is owned by exactly one lease, so copying is disabled. */
     lease(const lease&) = delete;
@@ -124,7 +128,7 @@ public:
     lease(lease&& other) noexcept : caps_(other.caps_), value_(other.value_)
     {
         other.caps_ = nullptr;
-        other.value_ = abi::v1::borrow{};
+        other.value_ = abi::v2::borrow{};
     }
 
     /**
@@ -141,12 +145,12 @@ public:
     {
         if (this != &other) {
             // reset() empties this lease with ok when it holds nothing at all.
-            const abi::v1::status status = reset();
-            if (status == abi::v1::ok || status == abi::v1::stale) {
+            const abi::v2::status status = reset();
+            if (status == abi::v2::ok || status == abi::v2::stale) {
                 caps_ = other.caps_;
                 value_ = other.value_;
                 other.caps_ = nullptr;
-                other.value_ = abi::v1::borrow{};
+                other.value_ = abi::v2::borrow{};
             }
         }
         return *this;
@@ -171,39 +175,39 @@ public:
      *         icaps was known; otherwise the status from icaps::release(), e.g. wrong_thread,
      *         busy or failed.
      *
-     * @note The pointer and the credential are cleared only for ok and stale. Every other status
-     *       is treated as retryable and leaves the lease exactly as it was, because dropping the
-     *       credential would silently lose a borrow the host still tracks. Callers must retry on
-     *       the control thread until the status is no longer retryable; the function never
-     *       throws, is idempotent once empty, and is the function to call from
-     *       irevoker::on_revoke() when lease.matches(credential) is true.
+     * @note The credential is cleared only for ok and stale. Every other status is treated as
+     *       retryable and leaves the lease exactly as it was, because dropping the credential would
+     *       silently lose a borrow the host still tracks. Callers must retry on the control thread
+     *       until the status is no longer retryable; the function never throws, is idempotent once
+     *       empty, and is the function to call from irevoker::on_revoke() when
+     *       lease.matches(credential) is true.
      */
-    abi::v1::status reset() noexcept
+    abi::v2::status reset() noexcept
     {
         if (value_.credential.value == 0) {
-            value_ = abi::v1::borrow{};
-            return abi::v1::ok;
+            value_ = abi::v2::borrow{};
+            return abi::v2::ok;
         }
-        if (caps_ == nullptr) return abi::v1::invalid_state;
-        const abi::v1::status status = caps_->release(value_.credential);
-        if (status == abi::v1::ok || status == abi::v1::stale) value_ = abi::v1::borrow{};
+        if (caps_ == nullptr) return abi::v2::invalid_state;
+        const abi::v2::status status = caps_->release(value_.credential);
+        if (status == abi::v2::ok || status == abi::v2::stale) value_ = abi::v2::borrow{};
         return status;
     }
 
-    /** @brief Borrowed interface pointer, or null when empty; the host, not the lease, owns it. */
-    T* get() const noexcept { return static_cast<T*>(value_.ptr); }
-
-    /** @brief Member access on the borrowed interface; undefined when the lease is empty. */
-    T* operator->() const noexcept { return get(); }
-
-    /** @brief True while a borrowed interface and a credential are held. */
-    explicit operator bool() const noexcept { return value_.ptr != nullptr; }
+    /**
+     * @brief True while a non-zero credential is held, i.e. this lease still pins its provider.
+     *
+     * @note This is the whole ownership state: there is no separate pointer to test, so bool and
+     *       credential() always agree.
+     */
+    explicit operator bool() const noexcept { return value_.credential.value != 0; }
 
     /**
-     * @brief Credential getter used to match an incoming revocation against this lease.
-     * @return The owned credential, or a zero token when the lease is empty.
+     * @brief Credential getter used to bind methods and to match an incoming revocation.
+     * @return The owned credential, or a zero token when the lease is empty. This is the value to
+     *         pass to icalls::bind_name()/bind_id(); it is never a provider address.
      */
-    abi::v1::token credential() const noexcept { return value_.credential; }
+    abi::v2::token credential() const noexcept { return value_.credential; }
 
     /**
      * @brief Test whether a revocation names the credential this lease still holds.
@@ -212,14 +216,14 @@ public:
      * @return True only when this lease holds exactly that non-zero credential, so an unrelated
      *         or already returned revocation is ignored instead of triggering a second release.
      */
-    bool matches(abi::v1::token revoked) const noexcept
+    bool matches(abi::v2::token revoked) const noexcept
     {
         return value_.credential.value != 0 && value_.credential.value == revoked.value;
     }
 
 private:
-    abi::v1::icaps* caps_ = nullptr;
-    abi::v1::borrow value_{};
+    abi::v2::icaps* caps_ = nullptr;
+    abi::v2::borrow value_{};
 };
 
 /**
@@ -233,7 +237,7 @@ private:
  * @note iwriter deliberately has no virtual destructor; a string_writer is stack-owned by its
  *       caller and must not be deleted through the ABI base pointer.
  */
-class string_writer final : public abi::v1::iwriter {
+class string_writer final : public abi::v2::iwriter {
 public:
     /**
      * @brief Bind to a target string and its maximum size.
@@ -261,27 +265,27 @@ public:
      *       a complete one. Exceptions are caught here because iwriter::write is noexcept and
      *       must not unwind into the ABI.
      */
-    abi::v1::status U42_CALL write(abi::v1::bytes data) noexcept override
+    abi::v2::status U42_CALL write(abi::v2::bytes data) noexcept override
     {
-        if (status_ != abi::v1::ok) return status_;
-        if (out_ == nullptr) return record(abi::v1::invalid_argument);
-        if (data.size != 0 && data.data == nullptr) return record(abi::v1::invalid_argument);
+        if (status_ != abi::v2::ok) return status_;
+        if (out_ == nullptr) return record(abi::v2::invalid_argument);
+        if (data.size != 0 && data.data == nullptr) return record(abi::v2::invalid_argument);
         const std::size_t used = out_->size();
         const std::size_t room = used < limit_ ? limit_ - used : 0;
-        if (data.size > static_cast<std::uint64_t>(room)) return record(abi::v1::limit_exceeded);
+        if (data.size > static_cast<std::uint64_t>(room)) return record(abi::v2::limit_exceeded);
         if (data.size != 0) {
             try {
                 out_->append(static_cast<const char*>(data.data),
                              static_cast<std::size_t>(data.size));
             } catch (...) {
-                return record(abi::v1::failed);
+                return record(abi::v2::failed);
             }
         }
         return status_;
     }
 
     /** @brief Sticky result of the writes so far; ok until the first failure. */
-    abi::v1::status status() const noexcept { return status_; }
+    abi::v2::status status() const noexcept { return status_; }
 
 private:
     /**
@@ -290,15 +294,15 @@ private:
      * @param status Failure to record when no failure was recorded yet.
      * @return The recorded sticky status.
      */
-    abi::v1::status record(abi::v1::status status) noexcept
+    abi::v2::status record(abi::v2::status status) noexcept
     {
-        if (status_ == abi::v1::ok) status_ = status;
+        if (status_ == abi::v2::ok) status_ = status;
         return status_;
     }
 
     std::string* out_ = nullptr;
     std::size_t limit_ = 0;
-    abi::v1::status status_ = abi::v1::ok;
+    abi::v2::status status_ = abi::v2::ok;
 };
 
 } // namespace sdk

@@ -2,6 +2,12 @@
  * @file runtime_test.cc
  * @brief Self-contained contract checks for the 42U host runtime; no external test framework.
  *
+ * ABI v2 is invoke-only: plugins never share a business class, a business interface pointer or a
+ * provider iinvoke pointer. The only business path is consumer -> host icalls -> provider
+ * iinvoke. The fake plugins below therefore announce a data-only protocol contract
+ * (abi::contract{id, major, minor}) plus their method list, and every borrow is verified through
+ * its opaque credential and a controlled business call, never through a stored pointer.
+ *
  * The file owns its main() and only depends on the public headers <42u/abi.hpp> and
  * <42u/host.hpp>, so it stays independent of the host implementation that is still being
  * written. Until the library links, validate it with a syntax-only compile:
@@ -13,9 +19,12 @@
  *    whose lifetime always exceeds the host under test;
  *  - a single global test trace that records lifecycle entry points in call order;
  *  - CHECK for the test body and RECORD for code that runs inside a noexcept plugin
- *    callback: RECORD only counts the failure, the surrounding test (or main) observes it.
+ *    callback: RECORD only counts the failure, the surrounding test (or main) observes it;
+ *  - @ref admin_lease: a control-thread administration lease whose revoker outlives the
+ *    credential, used to reach the host bind/call entries without repeating acquire/release.
  *
- * Covered contracts (design baseline docs/42U插件框架设计.md):
+ * Covered contracts (design baseline docs/42U插件框架设计.md, migration contract
+ * docs/thinks/invoke-v2-implementation-contract.md):
  *  - all plugins init before the first start; start order equals the initialization plan;
  *  - priority and before/after drive that single shared order;
  *  - stop and destroy run in reverse plan order;
@@ -23,16 +32,21 @@
  *  - start failure revokes announced capabilities and stops every initialized instance;
  *  - duplicate plug_id is refused;
  *  - unknown interface queries clear their output; known host services resolve;
- *  - capabilities exist only after a successful start: an initialized consumer may hold a
- *    borrowed interface but must not issue a business call;
+ *  - a plugin query exposes only the host-private invoke_iid subobject and no business
+ *    interface, and the host reaches the method through that gateway;
+ *  - capabilities exist only after a successful start: an initialized consumer may lease and
+ *    bind but must not issue a business call;
+ *  - a lease is a credential, not a pointer: bindings are created from the credential and a
+ *    call goes through the host gateway to the provider's iinvoke;
  *  - name and numeric method binding reach the same implementation;
- *  - unknown method/plugin, null required pointers and stale bindings return a definite error
- *    and clear the caller-owned output;
- *  - partial output of a failed call is discarded, and the output limit stays sticky even if
- *    the plugin ignores the writer failure;
+ *  - unknown method/plugin, null required pointers, zero credentials and stale bindings return a
+ *    definite error and clear the caller-owned output;
+ *  - unbinding a method never returns the lease; releasing the lease invalidates its bindings;
+ *  - partial output of a failed call is discarded, and the output limit stays sticky even if the
+ *    plugin ignores the writer failure;
  *  - revoking a lease lets the provider unload; an unreturned lease isolates the provider;
- *  - after a reload the old binding and the old borrow credential are stale while the new
- *    generation is usable;
+ *  - after a reload the old binding and the old lease credential are stale while the new
+ *    generation is usable after a fresh acquire and bind;
  *  - unloading a consumer first returns its outbound leases;
  *  - a borrow cycle is fully returned by shutdown without recursive unloading.
  *
@@ -60,6 +74,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -68,7 +83,16 @@
 
 namespace {
 
-namespace abi = u42::abi::v1;
+namespace abi = u42::abi::v2;
+
+// A lease is a credential and nothing else: these guards fail the build if a business pointer
+// ever creeps back into borrow or into the capability announcement.
+static_assert(sizeof(abi::borrow) == sizeof(abi::token),
+              "a v2 lease must carry only a credential, never a business pointer");
+static_assert(alignof(abi::borrow) == alignof(abi::token),
+              "a v2 lease must not gain alignment from a hidden pointer");
+static_assert(sizeof(abi::caps_desc) == 40,
+              "a v2 capability set carries a protocol and methods, not an interface list");
 
 /* ------------------------------------------------------------------ *
  * Test harness: CHECK aborts with a non-zero exit status, RECORD only
@@ -342,6 +366,28 @@ void check_not_ok(const char* label, abi::status actual)
     CHECK(actual != abi::ok);
 }
 
+/**
+ * @brief Assert that a status is one of an explicitly allowed set.
+ *
+ * Used where the contract names a set rather than a single code, for example an
+ * already-withdrawn but still-live lease.
+ */
+void check_one_of(const char* label, abi::status actual, std::initializer_list<abi::status> allowed)
+{
+    for (const abi::status candidate : allowed) {
+        if (actual == candidate) return;
+    }
+    std::string text;
+    for (const abi::status candidate : allowed) {
+        if (!text.empty()) text += " or ";
+        text += status_name(candidate);
+    }
+    std::fprintf(stderr, "%s: status %u (%s) is not %s\n", label,
+                 static_cast<unsigned>(actual), status_name(actual), text.c_str());
+    std::fflush(stderr);
+    CHECK(false);
+}
+
 /** @brief Assert an ordered identity sequence, printing both sides on mismatch. */
 void check_sequence(const char* label, const std::vector<std::string>& actual,
                     const std::vector<std::string>& expected)
@@ -354,28 +400,21 @@ void check_sequence(const char* label, const std::vector<std::string>& actual,
 }
 
 /* ------------------------------------------------------------------ *
- * Test-only typed interface and writer used by the borrow path.
+ * Test-only data contract and writer.
  * Neither type is part of the ABI; both sides of the test are built together.
  * ------------------------------------------------------------------ */
 
-/** @brief Frozen-shape test contract reached through icaps::acquire(). */
-inline constexpr abi::iid typed_iface_iid{0x746573745f696600ULL, 0x0001};
+/** @brief Business protocol family announced by every fake provider in this file. */
+inline constexpr abi::iid test_protocol{0x7465737434325532ULL, 0x0001};
 
-/** @brief Typed interface the fake provider exposes for the borrow path. */
-struct typed_iface {
-    /**
-     * @brief Append the NUL-terminated text to the caller-owned writer.
-     *
-     * @param text Borrowed text; null is rejected.
-     * @param out Caller-owned writer; null is rejected.
-     * @return ABI status; never throws.
-     */
-    virtual abi::status U42_CALL echo(const char* text, abi::iwriter* out) noexcept = 0;
-protected:
-    ~typed_iface() = default;
-};
+/** @brief Data-only contract every fake provider offers and every fake consumer requires. */
+inline constexpr abi::contract test_contract{test_protocol, 1, 0};
 
-/** @brief Minimal caller-owned writer for direct typed calls. */
+/** @brief Method identity of the fake provider's dynamic methods. */
+inline constexpr abi::method_id echo_method = 7;
+inline constexpr abi::method_id ping_method = 9;
+
+/** @brief Minimal caller-owned writer for direct icalls::call invocations. */
 struct buffer_writer final : abi::iwriter {
     std::string value;
     abi::status result = abi::ok;
@@ -391,9 +430,92 @@ struct buffer_writer final : abi::iwriter {
     }
 };
 
-/** @brief Method identity of the fake provider's dynamic methods. */
-inline constexpr abi::method_id echo_method = 7;
-inline constexpr abi::method_id ping_method = 9;
+/* ------------------------------------------------------------------ *
+ * Administration lease helper.
+ * ------------------------------------------------------------------ */
+
+/**
+ * @brief Control-thread administration lease whose revoker outlives the credential.
+ *
+ * Acquiring a lease needs a revocation receiver that stays alive and at a stable address until
+ * the credential is returned. This helper owns both, so a test can hold the host bind/call
+ * entries without repeating acquire/release, and the receiver is still valid when the provider
+ * is revoked by unload() or shutdown(); it then returns the credential immediately instead of
+ * fabricating a borrow.
+ *
+ * @note The revoker is a member of this object and the object lives for the whole lease
+ *       lifetime; a temporary or stack-copied receiver would be a dangling pointer.
+ */
+class admin_lease {
+public:
+    /**
+     * @brief Acquire one administration lease and keep its receiver alive.
+     *
+     * @param host Host under test, bound to the constructing control thread.
+     * @param plug_id Provider identity.
+     * @param required Explicitly accepted protocol.
+     */
+    admin_lease(u42::host& host, std::string plug_id, abi::contract required)
+        : host_(&host), plug_id_(std::move(plug_id))
+    {
+        status_ = host_->acquire(plug_id_, required, &revoker_, &borrow_);
+    }
+
+    ~admin_lease() { (void)release(); }
+    admin_lease(const admin_lease&) = delete;
+    admin_lease& operator=(const admin_lease&) = delete;
+
+    /** @brief Status of the acquire() performed by the constructor. */
+    abi::status status() const noexcept { return status_; }
+
+    /** @brief True while this object still owns a credential. */
+    bool holds() const noexcept { return borrow_.credential.value != 0; }
+
+    /** @brief Current credential; zero when the lease was refused or already returned. */
+    abi::token credential() const noexcept { return borrow_.credential; }
+
+    /** @brief Number of revocation callbacks observed on the owned receiver. */
+    std::uint64_t revocations() const noexcept { return revoker_.calls; }
+
+    /**
+     * @brief Return the credential through the host and clear the local token on ok/stale.
+     *
+     * @return The host's release status; a busy/failed return keeps ownership here so the
+     *         caller can retry instead of pretending the lease was returned.
+     */
+    abi::status release()
+    {
+        if (borrow_.credential.value == 0) return abi::stale;
+        const abi::status released = host_->release(borrow_.credential);
+        if (released == abi::ok || released == abi::stale) borrow_ = {};
+        return released;
+    }
+
+    /** @brief Receiver that hands the credential back during revocation. */
+    struct revoker_type final : abi::irevoker {
+        admin_lease* owner = nullptr;
+        std::uint64_t calls = 0;
+        abi::status release_status = abi::failed;
+
+        explicit revoker_type(admin_lease* value) noexcept : owner(value) {}
+        revoker_type(const revoker_type&) = delete;
+        revoker_type& operator=(const revoker_type&) = delete;
+
+        void U42_CALL on_revoke(abi::token value) noexcept override
+        {
+            ++calls;
+            release_status = owner->host_->release(value);
+            if (release_status == abi::ok || release_status == abi::stale) owner->borrow_ = {};
+        }
+    };
+
+private:
+    u42::host* host_ = nullptr;
+    std::string plug_id_;
+    abi::borrow borrow_{};
+    abi::status status_ = abi::failed;
+    revoker_type revoker_{this};
+};
 
 /* ------------------------------------------------------------------ *
  * Configurable fake plugin.
@@ -406,11 +528,11 @@ struct fake_behavior {
     abi::status init_status = abi::ok;
     abi::status start_status = abi::ok;
     abi::status stop_status = abi::ok;
-    /** Announce the interface and both methods during start(). */
+    /** Announce the protocol and both methods during start(). */
     bool announce = true;
     /** Register an icaps::watch during init(). */
     bool watch_in_init = false;
-    /** Run the acquire/bind/call probes during init(). */
+    /** Run the lease/bind/call probes during init(). */
     bool probe_in_init = false;
     /** Run the same probes from the capability callback, while still Initialized. */
     bool probe_on_capability = false;
@@ -422,8 +544,12 @@ struct fake_behavior {
     bool partial_output = false;
     /** Echo with empty arguments keeps writing after the writer reported a failure. */
     bool limit_blow = false;
-    /** Never return the borrow credential from on_revoke(). */
+    /** Never return the lease credential from on_revoke(). */
     bool ignore_revocation = false;
+    /** Protocol this instance announces; a data-only contract, never an interface. */
+    abi::contract protocol = test_contract;
+    /** Protocol this instance requires when it leases a peer. */
+    abi::contract required = test_contract;
     /** Peer plugin identity used by the init probes and acquire_peer(). */
     std::string peer;
 };
@@ -435,7 +561,7 @@ struct cap_notice {
     bool saw_null_plug_id = false;
     bool counts_consistent = false;
     bool methods_described = true;
-    std::vector<abi::iid> interfaces;
+    abi::contract protocol{};
     std::vector<abi::method_id> methods;
     std::vector<std::string> method_names;
 };
@@ -480,8 +606,20 @@ struct lease_revoker final : abi::irevoker {
     void U42_CALL on_revoke(abi::token credential) noexcept override;
 };
 
-/** @brief Instance-side fake plugin: provider, consumer and probe host in one type. */
-class fake_plug final : public abi::iplug, public abi::iinvoke, public typed_iface {
+/**
+ * @brief Test-only extra polymorphic base.
+ *
+ * It exists so the fake has a second non-primary base address: the invoke conversion check is
+ * only meaningful when the iinvoke subobject is not at offset zero. It declares no function that
+ * the host or another plugin could mistake for a business entry point.
+ */
+struct plug_extra {
+    virtual ~plug_extra() = default;
+    std::uint64_t marker = 0;
+};
+
+/** @brief Instance-side fake plugin: provider, consumer and host probe in one type. */
+class fake_plug final : public abi::iplug, public abi::iinvoke, public plug_extra {
 public:
     explicit fake_plug(fake_factory& owner) noexcept;
 
@@ -491,21 +629,25 @@ public:
     abi::status U42_CALL stop() noexcept override;
     void U42_CALL destroy() noexcept override;
     abi::status U42_CALL query(const abi::iid* type, void** out) noexcept override;
-    // iinvoke
+    // iinvoke: the host-private gateway, never handed to another plugin.
     abi::status U42_CALL invoke(abi::method_id method, abi::bytes args,
                                abi::iwriter* result) noexcept override;
-    // typed_iface
-    abi::status U42_CALL echo(const char* text, abi::iwriter* out) noexcept override;
 
     // Test-side driving of the consumer role.
     abi::status acquire_from(const std::string& provider);
     abi::status acquire_peer();
+    /** @brief Bind "echo" under the credential of the currently held lease. */
+    abi::status bind_bound_method();
+    /** @brief Bind one named method under the currently held credential. */
+    abi::status bind_named(const std::string& method, abi::binding* out);
+    /** @brief Invoke the bound method with the given text through the host gateway. */
+    abi::status call_bound_method(std::string text, std::string* out);
     abi::status release_lease();
     abi::status release_token(abi::token value);
-    abi::status call_cached_iface(std::string* out);
-    /** @brief Borrow and try to call the provider from inside a capability callback. */
+    /** @brief Lease and bind the provider from inside a capability callback. */
     void run_capability_probe(const std::string& provider);
     bool holds_lease() const noexcept { return lease_.credential.value != 0; }
+    bool has_binding() const noexcept { return binding_.value != 0; }
     /** @brief Note a credential returned by the host revocation protocol. */
     void on_lease_returned(abi::token value, abi::status status) noexcept;
 
@@ -514,7 +656,7 @@ public:
 
     // Lifecycle observations.
     std::uint64_t base_address = 0;
-    std::uint64_t typed_iface_address = 0;
+    std::uint64_t extra_address = 0;
     std::uint64_t invoke_address = 0;
     std::uint64_t init_calls = 0;
     std::uint64_t start_calls = 0;
@@ -533,7 +675,7 @@ public:
     abi::status null_type_status = abi::failed;
     bool null_type_untouched = false;
     abi::status null_out_status = abi::failed;
-    // Capability probes.
+    // Capability and lease probes.
     abi::status announce_status = abi::failed;
     std::uint64_t announce_calls = 0;
     abi::status probe_acquire = abi::failed;
@@ -557,19 +699,19 @@ public:
     std::uint64_t writes_attempted = 0;
     std::int64_t first_failure_index = -1;
     abi::status observed_after_failure = abi::ok;
-    // Consumer state.
+    // Consumer state: a credential plus a binding created from it, never a business pointer.
     abi::icaps* caps_ = nullptr;
     abi::icalls* calls_ = nullptr;
     cap_recorder cap_sink{this};
     lease_revoker revoker{this};
     abi::borrow lease_{};
+    abi::binding binding_{};
     abi::status last_acquire = abi::failed;
     bool last_acquire_cleared = false;
     abi::status last_release = abi::failed;
     std::uint64_t acquire_calls = 0;
     std::uint64_t lease_returns = 0;
     std::uint64_t stale_release_calls = 0;
-    typed_iface* cached_iface = nullptr;
 
 private:
     fake_factory& owner_;
@@ -623,7 +765,6 @@ private:
     std::vector<const char*> before_ptrs_;
     std::vector<const char*> after_ptrs_;
     abi::plug_desc desc_{};
-    std::vector<abi::iid> interfaces_;
     std::vector<method_holder> methods_;
     std::vector<abi::method_desc> method_descs_;
     abi::caps_desc caps_{};
@@ -655,7 +796,6 @@ fake_factory::fake_factory(std::string plug_id, fake_behavior behavior, std::int
 {
     before_ptrs_.reserve(before_.size());
     after_ptrs_.reserve(after_.size());
-    interfaces_.push_back(typed_iface_iid);
     methods_.reserve(2);
     methods_.push_back(method_holder{"echo", "Echo the request bytes back", "{}", "{}",
                                      abi::method_desc{}});
@@ -687,11 +827,11 @@ void fake_factory::finalize()
     }
     method_descs_.reserve(methods_.size());
     for (const method_holder& method : methods_) method_descs_.push_back(method.desc);
+    // v2 announcement: one plugin-wide data contract plus its method set; no interface list.
     caps_.struct_size = sizeof(abi::caps_desc);
-    caps_.interface_count = static_cast<std::uint32_t>(interfaces_.size());
-    caps_.interfaces = interfaces_.empty() ? nullptr : interfaces_.data();
     caps_.method_count = static_cast<std::uint32_t>(method_descs_.size());
     caps_.methods = method_descs_.empty() ? nullptr : method_descs_.data();
+    caps_.protocol = behavior_.protocol;
 }
 
 abi::status U42_CALL fake_factory::describe(const abi::plug_desc** out) noexcept
@@ -739,11 +879,7 @@ void cap_recorder::on_capability(const abi::cap_event* value) noexcept
     notice.available = value->available != 0;
     const abi::caps_desc& caps = value->capabilities;
     notice.counts_consistent = caps.struct_size == sizeof(abi::caps_desc);
-    if (caps.interface_count != 0 && caps.interfaces != nullptr) {
-        for (std::uint32_t index = 0; index < caps.interface_count; ++index) {
-            notice.interfaces.push_back(caps.interfaces[index]);
-        }
-    }
+    notice.protocol = caps.protocol;
     if (caps.method_count != 0 && caps.methods != nullptr) {
         for (std::uint32_t index = 0; index < caps.method_count; ++index) {
             const abi::method_desc& method = caps.methods[index];
@@ -757,7 +893,6 @@ void cap_recorder::on_capability(const abi::cap_event* value) noexcept
         }
     }
     notice.counts_consistent = notice.counts_consistent &&
-                               caps.interface_count == notice.interfaces.size() &&
                                caps.method_count == notice.methods.size();
     notices.push_back(std::move(notice));
     if (owner != nullptr) {
@@ -811,8 +946,9 @@ void fake_plug::on_lease_returned(abi::token value, abi::status status) noexcept
     ++lease_returns;
     last_release = status;
     if (lease_.credential.value == value.value) {
+        // The returned credential ends this generation's session: no binding survives it.
         lease_ = {};
-        cached_iface = nullptr;
+        binding_ = {};
     }
 }
 
@@ -822,7 +958,7 @@ abi::status U42_CALL fake_plug::init(abi::ictx* ctx) noexcept
     trace("init", id());
     const fake_behavior& mode = behavior();
     base_address = reinterpret_cast<std::uint64_t>(static_cast<abi::iplug*>(this));
-    typed_iface_address = reinterpret_cast<std::uint64_t>(static_cast<typed_iface*>(this));
+    extra_address = reinterpret_cast<std::uint64_t>(static_cast<plug_extra*>(this));
     invoke_address = reinterpret_cast<std::uint64_t>(static_cast<abi::iinvoke*>(this));
     if (ctx == nullptr) {
         RECORD_NOTE("init() received a null host context");
@@ -872,28 +1008,31 @@ abi::status U42_CALL fake_plug::init(abi::ictx* ctx) noexcept
     }
 
     if (mode.probe_in_init && caps_ != nullptr && calls_ != nullptr) {
+        const abi::contract required = mode.required;
         abi::borrow probe{};
-        probe.ptr = reinterpret_cast<void*>(0x1);
-        probe.credential.value = 0x2;
-        probe_acquire = caps_->acquire(mode.peer.c_str(), &typed_iface_iid, &revoker, &probe);
-        probe_acquire_cleared = probe.ptr == nullptr && probe.credential.value == 0;
+        probe.credential.value = 0x2; // dirty: a failed acquire must clear it
+        probe_acquire = caps_->acquire(mode.peer.c_str(), &required, &revoker, &probe);
+        probe_acquire_cleared = probe.credential.value == 0;
         if (probe_acquire == abi::ok) {
             lease_ = probe;
-            cached_iface = static_cast<typed_iface*>(probe.ptr);
+            binding_ = {};
         }
         abi::binding by_name{};
         by_name.value = 0x3;
-        probe_bind_name = calls_->bind_name(mode.peer.c_str(), "echo", &by_name);
+        probe_bind_name = calls_->bind_name(probe.credential, "echo", &by_name);
+        probe_binding_value = by_name.value;
         probe_binding_cleared = by_name.value == 0;
         abi::binding by_id{};
         by_id.value = 0x3;
-        probe_bind_id = calls_->bind_id(mode.peer.c_str(), echo_method, &by_id);
+        probe_bind_id = calls_->bind_id(probe.credential, echo_method, &by_id);
         probe_binding_cleared = probe_binding_cleared && by_id.value == 0;
-        // While this instance is only Initialized, a business call must not go through.
+        // No live credential exists while the provider is not active, so no business call can
+        // be routed at all.
         buffer_writer writer;
         if (probe_bind_name == abi::ok) {
+            binding_ = by_name;
             probe_call = calls_->call(by_name, abi::bytes{nullptr, 0}, &writer);
-            calls_->unbind(by_name);
+            probe_binding_intact = by_name.value == probe_binding_value && by_name.value != 0;
         } else {
             probe_call = probe_bind_name;
         }
@@ -940,26 +1079,16 @@ abi::status U42_CALL fake_plug::query(const abi::iid* type, void** out) noexcept
 {
     if (type == nullptr || out == nullptr) return abi::invalid_argument;
     *out = nullptr;
-    if (*type == typed_iface_iid) {
-        typed_iface* converted = static_cast<typed_iface*>(this);
-        // A wrong multiple-inheritance conversion would silently hand out a wrong address.
-        RECORD(reinterpret_cast<std::uint64_t>(converted) == typed_iface_address);
-        *out = converted;
-        return abi::ok;
-    }
     if (*type == abi::invoke_iid) {
         abi::iinvoke* converted = static_cast<abi::iinvoke*>(this);
+        // A wrong multiple-inheritance conversion would silently hand out a wrong address.
         RECORD(reinterpret_cast<std::uint64_t>(converted) == invoke_address);
         *out = converted;
         return abi::ok;
     }
+    // No business interface is exposed to a consumer: the announced protocol is data, and only
+    // the host ever asks for the private invoke gateway.
     return abi::unsupported;
-}
-
-abi::status U42_CALL fake_plug::echo(const char* text, abi::iwriter* out) noexcept
-{
-    if (text == nullptr || out == nullptr) return abi::invalid_argument;
-    return out->write(abi::bytes{text, std::strlen(text)});
 }
 
 abi::status U42_CALL fake_plug::invoke(abi::method_id method, abi::bytes args,
@@ -1007,14 +1136,14 @@ abi::status fake_plug::acquire_from(const std::string& provider)
 {
     ++acquire_calls;
     if (caps_ == nullptr) return abi::invalid_state;
+    const abi::contract required = behavior().required;
     abi::borrow result{};
-    result.ptr = reinterpret_cast<void*>(0x1);
-    result.credential.value = 0x1;
-    last_acquire = caps_->acquire(provider.c_str(), &typed_iface_iid, &revoker, &result);
-    last_acquire_cleared = result.ptr == nullptr && result.credential.value == 0;
+    result.credential.value = 0x1; // dirty: a failed acquire must clear it
+    last_acquire = caps_->acquire(provider.c_str(), &required, &revoker, &result);
+    last_acquire_cleared = result.credential.value == 0;
     if (last_acquire == abi::ok) {
         lease_ = result;
-        cached_iface = static_cast<typed_iface*>(result.ptr);
+        binding_ = {};
     }
     return last_acquire;
 }
@@ -1022,6 +1151,36 @@ abi::status fake_plug::acquire_from(const std::string& provider)
 abi::status fake_plug::acquire_peer()
 {
     return acquire_from(behavior().peer);
+}
+
+abi::status fake_plug::bind_bound_method()
+{
+    if (calls_ == nullptr || lease_.credential.value == 0) return abi::invalid_state;
+    abi::binding result{};
+    result.value = 0x1; // dirty: a failed bind must clear it
+    const abi::status bound = calls_->bind_name(lease_.credential, "echo", &result);
+    if (bound != abi::ok) {
+        binding_ = {};
+        return bound;
+    }
+    binding_ = result;
+    return bound;
+}
+
+abi::status fake_plug::bind_named(const std::string& method, abi::binding* out)
+{
+    if (calls_ == nullptr) return abi::invalid_state;
+    return calls_->bind_name(lease_.credential, method.c_str(), out);
+}
+
+abi::status fake_plug::call_bound_method(std::string text, std::string* out)
+{
+    if (calls_ == nullptr || binding_.value == 0) return abi::invalid_state;
+    buffer_writer writer;
+    const abi::status called =
+        calls_->call(binding_, abi::bytes{text.data(), text.size()}, &writer);
+    if (out != nullptr) *out = writer.value;
+    return called;
 }
 
 void fake_plug::run_capability_probe(const std::string& provider)
@@ -1033,30 +1192,32 @@ void fake_plug::run_capability_probe(const std::string& provider)
         RECORD_NOTE("the capability probe ran without the caps or calls service");
         return;
     }
+    const abi::contract required = behavior().required;
     abi::borrow probe{};
-    probe.ptr = reinterpret_cast<void*>(0x1);
-    probe.credential.value = 0x2;
-    probe_acquire = caps_->acquire(provider.c_str(), &typed_iface_iid, &revoker, &probe);
-    probe_acquire_cleared = probe.ptr == nullptr && probe.credential.value == 0;
+    probe.credential.value = 0x2; // dirty
+    probe_acquire = caps_->acquire(provider.c_str(), &required, &revoker, &probe);
+    probe_acquire_cleared = probe.credential.value == 0;
     if (probe_acquire == abi::ok) {
         lease_ = probe;
-        cached_iface = static_cast<typed_iface*>(probe.ptr);
+        binding_ = {};
     }
     abi::binding by_name{};
     by_name.value = 0x3;
-    probe_bind_name = calls_->bind_name(provider.c_str(), "echo", &by_name);
-    probe_binding_cleared = by_name.value == 0;
+    probe_bind_name = calls_->bind_name(probe.credential, "echo", &by_name);
     probe_binding_value = by_name.value;
+    probe_binding_cleared = by_name.value == 0;
     abi::binding by_id{};
     by_id.value = 0x3;
-    probe_bind_id = calls_->bind_id(provider.c_str(), echo_method, &by_id);
+    probe_bind_id = calls_->bind_id(probe.credential, echo_method, &by_id);
     probe_binding_cleared = probe_binding_cleared && by_id.value == 0;
     buffer_writer writer;
     if (probe_bind_name == abi::ok) {
+        // Keep the credential-bound binding: the lease stays valid once this consumer becomes
+        // Active, and the surrounding test reuses it to prove that.
+        binding_ = by_name;
         probe_call = calls_->call(by_name, abi::bytes{nullptr, 0}, &writer);
         // call() takes the binding by value, so a refusal must leave the caller's handle alone.
         probe_binding_intact = by_name.value == probe_binding_value && by_name.value != 0;
-        calls_->unbind(by_name);
     } else {
         probe_call = probe_bind_name;
     }
@@ -1067,13 +1228,7 @@ void fake_plug::run_capability_probe(const std::string& provider)
 abi::status fake_plug::release_lease()
 {
     if (caps_ == nullptr || lease_.credential.value == 0) return abi::invalid_state;
-    const abi::token value = lease_.credential;
-    last_release = caps_->release(value);
-    if (last_release == abi::ok) {
-        lease_ = {};
-        cached_iface = nullptr;
-    }
-    return last_release;
+    return release_token(lease_.credential);
 }
 
 abi::status fake_plug::release_token(abi::token value)
@@ -1081,24 +1236,16 @@ abi::status fake_plug::release_token(abi::token value)
     if (caps_ == nullptr) return abi::invalid_state;
     const abi::status released = caps_->release(value);
     if (released != abi::ok) {
-        ++stale_release_calls;
+        if (released == abi::stale) ++stale_release_calls;
         return released;
     }
-    // A successful return drops the cached pointer, but only for the credential this plugin holds.
+    // A successful return drops the session built on that credential, but only for the
+    // credential this instance actually holds.
     if (lease_.credential.value == value.value) {
         lease_ = {};
-        cached_iface = nullptr;
+        binding_ = {};
     }
     return released;
-}
-
-abi::status fake_plug::call_cached_iface(std::string* out)
-{
-    if (cached_iface == nullptr) return abi::invalid_state;
-    buffer_writer writer;
-    const abi::status called = cached_iface->echo("typed", &writer);
-    if (out != nullptr) *out = writer.value;
-    return called;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1354,11 +1501,16 @@ TEST_CASE(init_failure_rolls_back_without_any_start)
     CHECK(bad.instance()->destroy_calls == 1);
     CHECK(never.instance()->destroy_calls == 1);
 
-    // The failed batch must not leave a half-initialized instance callable.
-    abi::binding stale{};
-    stale.value = 0x5;
-    check_not_ok("bind after rollback", r.host().bind(r.id("good"), "echo", &stale));
-    CHECK(stale.value == 0);
+    // The failed batch must not leave a half-initialized instance reachable: no lease and no
+    // call can be issued against the rolled-back identity.
+    admin_lease blocked_lease(r.host(), r.id("good"), test_contract);
+    check_not_ok("acquire after rollback", blocked_lease.status());
+    CHECK(!blocked_lease.holds());
+    std::string output = "stale";
+    check_not_ok("call after rollback",
+                 r.host().call(r.id("good"), test_contract, "echo", abi::bytes{nullptr, 0},
+                               &output));
+    CHECK(output.empty());
     CHECK(g_failures == mark);
 }
 
@@ -1386,19 +1538,24 @@ TEST_CASE(start_failure_revokes_capabilities_and_stops_everything)
     check_sequence("stop order", trace_ids("stop"), reverse);
     CHECK(trace_count("destroy", r.id("provider")) == 1);
 
-    // The withdrawn capability must not be usable or re-bindable.
+    // The withdrawn capability must not be leasable, bindable or callable.
+    admin_lease blocked_lease(r.host(), r.id("provider"), test_contract);
+    check_not_ok("acquire after start failure", blocked_lease.status());
+    CHECK(!blocked_lease.holds());
     abi::binding handle{};
     handle.value = 0x7;
-    check_not_ok("bind after start failure", r.host().bind(r.id("provider"), "echo", &handle));
+    check_not_ok("bind after start failure", r.host().bind(blocked_lease.credential(), "echo",
+                                                           &handle));
     CHECK(handle.value == 0);
     std::string output = "stale";
     check_not_ok("call after start failure",
-                 r.host().call(r.id("provider"), "echo", abi::bytes{nullptr, 0}, &output));
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{nullptr, 0},
+                               &output));
     CHECK(output.empty());
 
-    // Note: the host withdraws the announced capability (proved by the failed bind/call above),
-    // but it is not required to publish a withdrawal notification to watchers when the whole
-    // batch is aborted; the design only mandates the notification duty for a single unload.
+    // Note: the host withdraws the announced capability (proved by the failed lease/bind/call
+    // above), but it is not required to publish a withdrawal notification to watchers when the
+    // whole batch is aborted; the design only mandates the notification duty for a single unload.
     check_status("poll", r.host().poll(), abi::ok);
     CHECK(g_failures == mark);
 }
@@ -1464,7 +1621,7 @@ TEST_CASE(host_services_resolve_and_unknown_query_clears)
     CHECK(g_failures == mark);
 }
 
-TEST_CASE(plugin_query_uses_correct_multiple_inheritance_pointers)
+TEST_CASE(plugin_query_exposes_only_the_host_private_invoke_subobject)
 {
     const std::size_t mark = g_failures;
     rack r;
@@ -1474,18 +1631,21 @@ TEST_CASE(plugin_query_uses_correct_multiple_inheritance_pointers)
     fake_plug* instance = factory.instance();
     CHECK(instance != nullptr);
     // Distinct base addresses make the checks below meaningful rather than tautological.
-    CHECK(instance->base_address != instance->typed_iface_address);
     CHECK(instance->base_address != instance->invoke_address);
+    CHECK(instance->base_address != instance->extra_address);
 
     const abi::iid unknown{0x1111222233334444ULL, 0x5555666677778888ULL};
     void* slot = reinterpret_cast<void*>(0x1);
     check_status("query(unknown)", instance->query(&unknown, &slot), abi::unsupported);
     CHECK(slot == nullptr);
 
+    // A consumer never receives a business interface: the announced protocol identity is not a
+    // queryable interface either, so no business pointer can be obtained this way.
     slot = reinterpret_cast<void*>(0x1);
-    check_status("query(typed)", instance->query(&typed_iface_iid, &slot), abi::ok);
-    CHECK(reinterpret_cast<std::uint64_t>(slot) == instance->typed_iface_address);
-
+    const abi::iid business_iid = test_protocol;
+    check_status("query(business protocol)", instance->query(&business_iid, &slot),
+                 abi::unsupported);
+    CHECK(slot == nullptr);
     slot = reinterpret_cast<void*>(0x1);
     check_status("query(invoke)", instance->query(&abi::invoke_iid, &slot), abi::ok);
     CHECK(reinterpret_cast<std::uint64_t>(slot) == instance->invoke_address);
@@ -1493,8 +1653,17 @@ TEST_CASE(plugin_query_uses_correct_multiple_inheritance_pointers)
     slot = nullptr;
     check_status("query(null type)", instance->query(nullptr, &slot), abi::invalid_argument);
     CHECK(slot == nullptr);
-    check_status("query(null output)", instance->query(&typed_iface_iid, nullptr),
+    check_status("query(null output)", instance->query(&abi::invoke_iid, nullptr),
                  abi::invalid_argument);
+
+    // The host reaches the method through that gateway and through nothing else.
+    std::string out = "stale";
+    check_status("call(host gateway)",
+                 r.host().call(r.id("multi"), test_contract, "echo", abi::bytes{"x", 1}, &out),
+                 abi::ok);
+    CHECK(out == "x");
+    CHECK(instance->invoke_calls == 1);
+    CHECK(instance->last_invoke_method == echo_method);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(g_failures == mark);
@@ -1522,25 +1691,32 @@ TEST_CASE(capabilities_are_unavailable_until_the_provider_started)
     CHECK(instance != nullptr);
     CHECK(instance->watch_status == abi::ok);
     CHECK(instance->watch_token.value != 0);
-    // The provider was not Active during the consumer's init, so no borrow could be granted.
+    // The provider was not Active during the consumer's init, so no lease could be granted.
     check_not_ok("acquire before provider start", instance->probe_acquire);
     CHECK(instance->probe_acquire_cleared);
-    // An Initialized consumer must not reach a business call either.
-    CHECK(instance->probe_business_blocked);
+    // Without a live credential every business entry point is refused and no output is produced.
+    check_status("bind name with no lease", instance->probe_bind_name, abi::invalid_argument);
+    check_status("bind id with no lease", instance->probe_bind_id, abi::invalid_argument);
     CHECK(instance->probe_binding_cleared);
+    CHECK(instance->probe_business_blocked);
+    CHECK(!instance->holds_lease());
+    CHECK(!instance->has_binding());
 
     // A watch registered during init still receives the current snapshot afterwards.
     check_status("poll", r.host().poll(), abi::ok);
     const cap_notice* notice = instance->cap_sink.last_for(r.id("provider"));
     CHECK(notice != nullptr);
-    if (notice != nullptr) CHECK(notice->available);
+    if (notice != nullptr) {
+        CHECK(notice->available);
+        CHECK(notice->protocol.id == test_contract.id);
+    }
     CHECK(instance->cap_sink.callback_count >= 1);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(g_failures == mark);
 }
 
-TEST_CASE(initialized_consumer_borrows_but_cannot_call)
+TEST_CASE(initialized_consumer_leases_but_cannot_call)
 {
     const std::size_t mark = g_failures;
     rack r;
@@ -1560,27 +1736,29 @@ TEST_CASE(initialized_consumer_borrows_but_cannot_call)
     // The announcement is delivered after the provider started and before the consumer does.
     CHECK(trace_position("start", r.id("provider")) < trace_position("start", r.id("consumer")));
     CHECK(instance->probe_while_initialized);
-    // An Initialized consumer may hold a borrowed interface ...
+    // An Initialized consumer may hold a lease credential and bind a published method ...
     check_status("acquire while initialized", instance->probe_acquire, abi::ok);
     CHECK(!instance->probe_acquire_cleared);
-    CHECK(instance->lease_.ptr != nullptr);
+    CHECK(instance->holds_lease());
     CHECK(instance->lease_.credential.value != 0);
-    CHECK(reinterpret_cast<std::uint64_t>(instance->lease_.ptr) ==
-          provider.instance()->typed_iface_address);
-    // ... but a business call must be refused while it is still Initialized: binding and
-    // borrowing are allowed for an Initialized consumer, calling is not.
     check_status("bind name while initialized", instance->probe_bind_name, abi::ok);
     check_status("bind id while initialized", instance->probe_bind_id, abi::ok);
     CHECK(instance->probe_binding_value != 0);
+    // ... but a business call must be refused while it is still Initialized: leasing and
+    // binding are allowed for an Initialized consumer, calling is not.
     check_status("call while initialized", instance->probe_call, abi::invalid_state);
     // The refused call takes the binding by value and must not clear the caller's handle.
     CHECK(instance->probe_binding_intact);
     CHECK(instance->probe_business_blocked);
+    CHECK(provider.instance()->invoke_calls == 0);
 
-    // Once the consumer is Active the same borrowed pointer works.
+    // Once the consumer is Active the same credential-bound binding works, and the call really
+    // reaches the provider gateway.
     std::string text;
-    check_status("typed call", instance->call_cached_iface(&text), abi::ok);
+    check_status("bound call", instance->call_bound_method("typed", &text), abi::ok);
     CHECK(text == "typed");
+    CHECK(provider.instance()->invoke_calls == 1);
+    CHECK(provider.instance()->last_invoke_method == echo_method);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     if (instance->revoker.notified) {
@@ -1616,11 +1794,22 @@ TEST_CASE(consumer_watch_receives_announced_capabilities)
         CHECK(!notice->saw_null_plug_id);
         CHECK(notice->counts_consistent);
         CHECK(notice->methods_described);
-        CHECK(notice->interfaces == std::vector<abi::iid>{typed_iface_iid});
+        CHECK(notice->protocol.id == test_contract.id);
+        CHECK(notice->protocol.major == test_contract.major);
+        CHECK(notice->protocol.minor == test_contract.minor);
         CHECK((notice->methods == std::vector<abi::method_id>{echo_method, ping_method}));
         CHECK((notice->method_names == std::vector<std::string>{"echo", "ping"}));
     }
     CHECK(instance->cap_sink.null_events == 0);
+
+    // Explicit discovery names the protocol only; it never hands out a business interface and
+    // is not a lifetime lock.
+    abi::contract discovered{};
+    check_status("protocol(provider)", r.host().protocol(r.id("provider"), &discovered),
+                 abi::ok);
+    CHECK(discovered.id == test_contract.id);
+    CHECK(discovered.major == test_contract.major);
+    CHECK(discovered.minor >= test_contract.minor);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(g_failures == mark);
@@ -1639,18 +1828,23 @@ TEST_CASE(name_and_id_invocation_reach_the_same_method)
     check_status("start", r.host().start(), abi::ok);
     fake_plug* instance = factory.instance();
 
+    // The administration context must hold a lease; there is no credential-free bind shortcut.
+    admin_lease lease(r.host(), r.id("provider"), test_contract);
+    check_status("acquire", lease.status(), abi::ok);
+    CHECK(lease.holds());
+
     abi::binding by_name{};
     abi::binding by_id{};
-    check_status("bind(name)", r.host().bind(r.id("provider"), "echo", &by_name), abi::ok);
+    check_status("bind(name)", r.host().bind(lease.credential(), "echo", &by_name), abi::ok);
     CHECK(by_name.value != 0);
-    check_status("bind(id)", r.host().bind(r.id("provider"), echo_method, &by_id), abi::ok);
+    check_status("bind(id)", r.host().bind(lease.credential(), echo_method, &by_id), abi::ok);
     CHECK(by_id.value != 0);
 
     const char* text = "hello";
     std::string from_name = "stale";
     std::string from_id = "stale";
-    check_status("call(bound name)",
-                 r.host().call(by_name, abi::bytes{text, 5}, &from_name), abi::ok);
+    check_status("call(bound name)", r.host().call(by_name, abi::bytes{text, 5}, &from_name),
+                 abi::ok);
     CHECK(from_name == "hello");
     check_status("call(bound id)", r.host().call(by_id, abi::bytes{text, 5}, &from_id), abi::ok);
     CHECK(from_id == from_name);
@@ -1659,34 +1853,58 @@ TEST_CASE(name_and_id_invocation_reach_the_same_method)
 
     std::string convenience_name = "stale";
     std::string convenience_id = "stale";
-    check_status("call(name)", r.host().call(r.id("provider"), "echo", abi::bytes{text, 5},
-                                             &convenience_name), abi::ok);
-    check_status("call(id)", r.host().call(r.id("provider"), echo_method, abi::bytes{text, 5},
-                                           &convenience_id), abi::ok);
+    check_status("call(name)",
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{text, 5},
+                               &convenience_name),
+                 abi::ok);
+    check_status("call(id)",
+                 r.host().call(r.id("provider"), test_contract, echo_method, abi::bytes{text, 5},
+                               &convenience_id),
+                 abi::ok);
     CHECK(convenience_name == convenience_id);
     CHECK(convenience_name == "hello");
     CHECK(instance->invoke_calls == 4);
 
     std::string pong_name = "stale";
     std::string pong_id = "stale";
-    check_status("call(name ping)", r.host().call(r.id("provider"), "ping", abi::bytes{nullptr, 0},
-                                                  &pong_name), abi::ok);
-    check_status("call(id ping)", r.host().call(r.id("provider"), ping_method,
-                                                abi::bytes{nullptr, 0}, &pong_id), abi::ok);
+    check_status("call(name ping)",
+                 r.host().call(r.id("provider"), test_contract, "ping", abi::bytes{nullptr, 0},
+                               &pong_name),
+                 abi::ok);
+    check_status("call(id ping)",
+                 r.host().call(r.id("provider"), test_contract, ping_method,
+                               abi::bytes{nullptr, 0}, &pong_id),
+                 abi::ok);
     CHECK(pong_name == "pong");
     CHECK(pong_id == "pong");
     CHECK(instance->last_invoke_method == ping_method);
 
-    // Each lookup owns its own record: releasing one must not disturb the other.
+    // Each binding owns its own record: releasing one must not disturb the other.
     check_status("unbind(name)", r.host().unbind(by_name), abi::ok);
     std::string still_bound = "stale";
     check_status("call(id) after unbind(name)", r.host().call(by_id, abi::bytes{text, 5},
-                                                              &still_bound), abi::ok);
+                                                              &still_bound),
+                 abi::ok);
     CHECK(still_bound == "hello");
     check_status("unbind(id)", r.host().unbind(by_id), abi::ok);
     std::string after_unbind = "stale";
-    check_not_ok("call after unbind", r.host().call(by_id, abi::bytes{text, 5}, &after_unbind));
+    check_status("call after unbind", r.host().call(by_id, abi::bytes{text, 5}, &after_unbind),
+                 abi::stale);
     CHECK(after_unbind.empty());
+    CHECK(instance->invoke_calls == 7);
+
+    // Unbinding never returns the lease, but releasing the lease invalidates its bindings.
+    abi::binding released_binding{};
+    check_status("bind before release", r.host().bind(lease.credential(), "echo", &released_binding),
+                 abi::ok);
+    check_status("release", lease.release(), abi::ok);
+    CHECK(!lease.holds());
+    std::string after_release = "stale";
+    check_status("call after release", r.host().call(released_binding, abi::bytes{text, 5},
+                                                     &after_release),
+                 abi::stale);
+    CHECK(after_release.empty());
+    check_status("unbind after release", r.host().unbind(released_binding), abi::stale);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(g_failures == mark);
@@ -1700,43 +1918,54 @@ TEST_CASE(unknown_method_and_invalid_arguments_are_definite_errors)
     r.stage(factory);
     check_status("start", r.host().start(), abi::ok);
 
+    admin_lease lease(r.host(), r.id("provider"), test_contract);
+    check_status("acquire", lease.status(), abi::ok);
+
     abi::binding handle{};
     handle.value = 0x5A;
-    check_status("bind(unknown name)", r.host().bind(r.id("provider"), "nosuch", &handle),
+    check_status("bind(unknown name)", r.host().bind(lease.credential(), "nosuch", &handle),
                  abi::not_found);
     CHECK(handle.value == 0);
     handle.value = 0x5A;
     check_status("bind(unknown id)",
-                 r.host().bind(r.id("provider"), static_cast<abi::method_id>(4242), &handle),
-                 abi::not_found);
-    CHECK(handle.value == 0);
-    handle.value = 0x5A;
-    check_status("bind(unknown plugin)", r.host().bind(r.id("nosuch"), "echo", &handle),
+                 r.host().bind(lease.credential(), static_cast<abi::method_id>(4242), &handle),
                  abi::not_found);
     CHECK(handle.value == 0);
 
+    // A missing provider is discovered by acquire, so no credential can ever name it.
+    admin_lease missing(r.host(), r.id("nosuch"), test_contract);
+    check_status("acquire(unknown plugin)", missing.status(), abi::not_found);
+    CHECK(!missing.holds());
+
     std::string output = "stale";
     check_status("call(unknown method)",
-                 r.host().call(r.id("provider"), "nosuch", abi::bytes{nullptr, 0}, &output),
+                 r.host().call(r.id("provider"), test_contract, "nosuch", abi::bytes{nullptr, 0},
+                               &output),
                  abi::not_found);
     CHECK(output.empty());
     output = "stale";
     check_status("call(unknown plugin)",
-                 r.host().call(r.id("nosuch"), "echo", abi::bytes{nullptr, 0}, &output),
+                 r.host().call(r.id("nosuch"), test_contract, "echo", abi::bytes{nullptr, 0},
+                               &output),
                  abi::not_found);
     CHECK(output.empty());
 
     // Required pointers: a null argument is a parameter error, never a partial result.
-    check_status("bind(null output)", r.host().bind(r.id("provider"), "echo", nullptr),
+    check_status("bind(null output)", r.host().bind(lease.credential(), "echo", nullptr),
                  abi::invalid_argument);
     check_status("call(null output)",
-                 r.host().call(r.id("provider"), "echo", abi::bytes{nullptr, 0}, nullptr),
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{nullptr, 0},
+                               nullptr),
                  abi::invalid_argument);
     output = "stale";
     check_status("call(zero binding)", r.host().call(abi::binding{}, abi::bytes{nullptr, 0}, &output),
                  abi::invalid_argument);
     CHECK(output.empty());
-    check_not_ok("unbind(zero binding)", r.host().unbind(abi::binding{}));
+    check_status("unbind(zero binding)", r.host().unbind(abi::binding{}), abi::invalid_argument);
+    handle.value = 0x5A;
+    check_status("bind(zero credential)", r.host().bind(abi::token{}, "echo", &handle),
+                 abi::invalid_argument);
+    CHECK(handle.value == 0);
 
     output = "stale";
     check_not_ok("call(fabricated binding)",
@@ -1747,18 +1976,19 @@ TEST_CASE(unknown_method_and_invalid_arguments_are_definite_errors)
     // Borrowed input bytes: null data is only legal for a zero length.
     output = "stale";
     check_status("call(null bytes with size)",
-                 r.host().call(r.id("provider"), "echo", abi::bytes{nullptr, 5}, &output),
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{nullptr, 5},
+                               &output),
                  abi::invalid_argument);
     CHECK(output.empty());
 
     // A successful bind replaces a dirty output; empty input is a legal call.
     abi::binding good{};
     good.value = 0x7;
-    check_status("bind succeeds", r.host().bind(r.id("provider"), "echo", &good), abi::ok);
+    check_status("bind succeeds", r.host().bind(lease.credential(), "echo", &good), abi::ok);
     CHECK(good.value != 0);
     output = "stale";
-    check_status("call(empty input)",
-                 r.host().call(r.id("provider"), "echo", abi::bytes{nullptr, 0}, &output), abi::ok);
+    check_status("call(empty input)", r.host().call(good, abi::bytes{nullptr, 0}, &output),
+                 abi::ok);
     CHECK(output.empty());
     check_status("unbind(good)", r.host().unbind(good), abi::ok);
 
@@ -1777,15 +2007,18 @@ TEST_CASE(partial_output_of_a_failed_call_is_discarded)
     check_status("start", r.host().start(), abi::ok);
 
     std::string output = "stale";
-    check_status("call(partial)", r.host().call(r.id("provider"), "echo", abi::bytes{"payload", 7},
-                                                &output),
+    check_status("call(partial)",
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{"payload", 7},
+                               &output),
                  abi::failed);
     CHECK(output.empty());
     // The plugin really did hand partial bytes to the writer before failing.
     CHECK(factory.instance()->writes_attempted == 1);
 
+    admin_lease lease(r.host(), r.id("provider"), test_contract);
+    check_status("acquire", lease.status(), abi::ok);
     abi::binding handle{};
-    check_status("bind", r.host().bind(r.id("provider"), "echo", &handle), abi::ok);
+    check_status("bind", r.host().bind(lease.credential(), "echo", &handle), abi::ok);
     std::string via_binding = "stale";
     check_status("call(partial via binding)",
                  r.host().call(handle, abi::bytes{"payload", 7}, &via_binding), abi::failed);
@@ -1810,7 +2043,8 @@ TEST_CASE(output_limit_is_reported_and_sticks)
 
     std::string output = "stale";
     check_status("call(over limit)",
-                 r.host().call(r.id("provider"), "echo", abi::bytes{nullptr, 0}, &output),
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{nullptr, 0},
+                               &output),
                  abi::limit_exceeded);
     CHECK(output.empty());
     fake_plug* instance = factory.instance();
@@ -1821,13 +2055,15 @@ TEST_CASE(output_limit_is_reported_and_sticks)
 
     // Exactly at the limit succeeds, one byte over is refused atomically.
     std::string at_limit = "stale";
-    check_status("call(at limit)", r.host().call(r.id("provider"), "echo", abi::bytes{"abcd", 4},
-                                                 &at_limit),
+    check_status("call(at limit)",
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{"abcd", 4},
+                               &at_limit),
                  abi::ok);
     CHECK(at_limit == "abcd");
     std::string over_limit = "stale";
     check_status("call(one over limit)",
-                 r.host().call(r.id("provider"), "echo", abi::bytes{"abcde", 5}, &over_limit),
+                 r.host().call(r.id("provider"), test_contract, "echo", abi::bytes{"abcde", 5},
+                               &over_limit),
                  abi::limit_exceeded);
     CHECK(over_limit.empty());
 
@@ -1836,7 +2072,7 @@ TEST_CASE(output_limit_is_reported_and_sticks)
 }
 
 /* ------------------------------------------------------------------ *
- * Borrow revocation, reload and unload ordering.
+ * Lease revocation, reload and unload ordering.
  * ------------------------------------------------------------------ */
 
 TEST_CASE(unload_revokes_the_lease_and_waits_for_the_return)
@@ -1856,9 +2092,15 @@ TEST_CASE(unload_revokes_the_lease_and_waits_for_the_return)
     fake_plug* instance = consumer.instance();
     check_status("acquire", instance->acquire_peer(), abi::ok);
     CHECK(instance->holds_lease());
-    CHECK(reinterpret_cast<std::uint64_t>(instance->lease_.ptr) ==
-          provider.instance()->typed_iface_address);
     const abi::token first = instance->lease_.credential;
+    // The session is built from the credential only; the binding is bound under that credential.
+    check_status("bind", instance->bind_bound_method(), abi::ok);
+    CHECK(instance->has_binding());
+    const abi::binding session_binding = instance->binding_;
+    std::string before;
+    check_status("call before unload", instance->call_bound_method("before", &before), abi::ok);
+    CHECK(before == "before");
+    CHECK(provider.instance()->invoke_calls == 1);
 
     check_status("unload(provider)", r.host().unload(r.id("provider")), abi::ok);
     CHECK(instance->revoker.notified);
@@ -1869,14 +2111,19 @@ TEST_CASE(unload_revokes_the_lease_and_waits_for_the_return)
     check_status("release inside on_revoke", instance->revoker.release_status, abi::ok);
     CHECK(instance->lease_returns == 1);
     CHECK(!instance->holds_lease());
-    CHECK(instance->cached_iface == nullptr);
+    CHECK(!instance->has_binding());
     CHECK(trace_count("stop", r.id("provider")) == 1);
     CHECK(trace_count("destroy", r.id("provider")) == 1);
     CHECK(sorted(r.host().plugins()) == std::vector<std::string>{r.id("consumer")});
 
-    // The returned credential must not match anything after the unload.
-    check_not_ok("release(stale credential)", instance->release_token(first));
+    // The returned credential and the binding it authorized must not match anything afterwards.
+    check_status("release(stale credential)", instance->release_token(first), abi::stale);
     CHECK(instance->stale_release_calls == 1);
+    buffer_writer stale_writer;
+    check_status("call(stale binding)",
+                 instance->calls_->call(session_binding, abi::bytes{nullptr, 0}, &stale_writer),
+                 abi::stale);
+    CHECK(stale_writer.value.empty());
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(g_failures == mark);
@@ -1899,6 +2146,9 @@ TEST_CASE(unreturned_lease_isolates_the_provider)
 
     fake_plug* instance = consumer.instance();
     check_status("acquire", instance->acquire_peer(), abi::ok);
+    check_status("bind", instance->bind_bound_method(), abi::ok);
+    const abi::binding held_binding = instance->binding_;
+    const abi::token held_credential = instance->lease_.credential;
 
     check_not_ok("unload with an unreturned lease", r.host().unload(r.id("provider")));
     CHECK(!r.host().error().empty());
@@ -1908,11 +2158,21 @@ TEST_CASE(unreturned_lease_isolates_the_provider)
     CHECK(instance->holds_lease());
     CHECK(r.host().plugins().size() == 2);
 
-    // Capabilities were withdrawn first: the isolated provider is no longer bindable.
+    // Capabilities were withdrawn first: the isolated provider can no longer be leased.
+    admin_lease blocked_lease(r.host(), r.id("provider"), test_contract);
+    check_not_ok("acquire(quarantined provider)", blocked_lease.status());
+    CHECK(!blocked_lease.holds());
+    // A still-live lease can neither bind a new method nor call a withdrawn provider.
     abi::binding handle{};
     handle.value = 0x1;
-    check_not_ok("bind(quarantined provider)", r.host().bind(r.id("provider"), "echo", &handle));
+    check_one_of("bind(quarantined provider)", instance->bind_named("echo", &handle),
+                 {abi::not_found, abi::invalid_state});
     CHECK(handle.value == 0);
+    buffer_writer withdrawn;
+    check_one_of("call(quarantined provider)",
+                 instance->calls_->call(held_binding, abi::bytes{nullptr, 0}, &withdrawn),
+                 {abi::not_found, abi::invalid_state});
+    CHECK(withdrawn.value.empty());
 
     // Returning the credential unblocks the unload.
     check_status("release", instance->release_lease(), abi::ok);
@@ -1921,6 +2181,7 @@ TEST_CASE(unreturned_lease_isolates_the_provider)
     CHECK(trace_count("stop", r.id("provider")) == 1);
     CHECK(trace_count("destroy", r.id("provider")) == 1);
     CHECK(sorted(r.host().plugins()) == std::vector<std::string>{r.id("consumer")});
+    CHECK(held_credential.value != 0);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(g_failures == mark);
@@ -1944,42 +2205,61 @@ TEST_CASE(reload_stales_old_handles_and_serves_a_new_generation)
     fake_plug* instance = consumer.instance();
     check_status("acquire(first generation)", instance->acquire_peer(), abi::ok);
     const abi::token first_token = instance->lease_.credential;
+    check_status("bind(first generation)", instance->bind_bound_method(), abi::ok);
+    const abi::binding first_binding = instance->binding_;
 
+    admin_lease admin(r.host(), r.id("provider"), test_contract);
+    check_status("admin acquire(first generation)", admin.status(), abi::ok);
     abi::binding old_binding{};
-    check_status("bind(first generation)", r.host().bind(r.id("provider"), "echo", &old_binding),
+    check_status("admin bind(first generation)", r.host().bind(admin.credential(), "echo",
+                                                               &old_binding),
                  abi::ok);
     std::string output = "stale";
-    check_status("call(first generation)",
+    check_status("admin call(first generation)",
                  r.host().call(old_binding, abi::bytes{"old", 3}, &output), abi::ok);
     CHECK(output == "old");
 
     check_status("unload(provider)", r.host().unload(r.id("provider")), abi::ok);
+    // Both leases went through the revocation path; the administration receiver stayed alive
+    // and returned its credential synchronously.
+    CHECK(admin.revocations() == 1);
+    CHECK(!admin.holds());
     CHECK(!instance->holds_lease());
+    CHECK(!instance->has_binding());
     output = "stale";
-    check_not_ok("call(stale binding)",
-                 r.host().call(old_binding, abi::bytes{"old", 3}, &output));
+    check_status("call(stale admin binding)",
+                 r.host().call(old_binding, abi::bytes{"old", 3}, &output), abi::stale);
     CHECK(output.empty());
+    buffer_writer stale_session;
+    check_status("call(stale session binding)",
+                 instance->calls_->call(first_binding, abi::bytes{nullptr, 0}, &stale_session),
+                 abi::stale);
+    CHECK(stale_session.value.empty());
 
     // Reload the same plugin type: a new instance and a new internal generation.
     check_status("add(reload)", r.host().add(&provider), abi::ok);
     check_status("start(reload)", r.host().start(), abi::ok);
     fake_plug* reloaded = provider.instance();
     CHECK(reloaded != nullptr);
+    CHECK(reloaded != instance);
     CHECK(reloaded->destroy_calls == 0);
 
+    // The same protocol still needs a fresh lease and a fresh binding; the old session must not
+    // be reused implicitly.
     check_status("acquire(new generation)", instance->acquire_peer(), abi::ok);
     CHECK(instance->holds_lease());
     const abi::token second_token = instance->lease_.credential;
     CHECK(second_token.value != first_token.value);
-    CHECK(reinterpret_cast<std::uint64_t>(instance->lease_.ptr) ==
-          reloaded->typed_iface_address);
-
     // The stale return must not match the new record, and must not break it.
-    check_not_ok("release(old credential)", instance->release_token(first_token));
+    check_status("release(old credential)", instance->release_token(first_token), abi::stale);
+    CHECK(instance->stale_release_calls == 1);
     CHECK(instance->holds_lease());
+    check_status("bind(new generation)", instance->bind_bound_method(), abi::ok);
     std::string typed;
-    check_status("call(new generation)", instance->call_cached_iface(&typed), abi::ok);
+    check_status("call(new generation)", instance->call_bound_method("typed", &typed), abi::ok);
     CHECK(typed == "typed");
+    CHECK(reloaded->invoke_calls == 1);
+    CHECK(reloaded->last_invoke_method == echo_method);
     check_status("release(new credential)", instance->release_token(second_token), abi::ok);
     CHECK(!instance->holds_lease());
 
@@ -2010,6 +2290,9 @@ TEST_CASE(consumer_unload_returns_its_outbound_leases)
     fake_plug* instance = consumer.instance();
     check_status("acquire", instance->acquire_peer(), abi::ok);
     CHECK(instance->holds_lease());
+    check_status("bind", instance->bind_bound_method(), abi::ok);
+    const abi::binding outbound = instance->binding_;
+    CHECK(outbound.value != 0);
 
     check_status("unload(consumer)", r.host().unload(r.id("consumer")), abi::ok);
     CHECK(trace_count("stop", r.id("consumer")) == 1);
@@ -2021,11 +2304,18 @@ TEST_CASE(consumer_unload_returns_its_outbound_leases)
     }
 
     // The provider is untouched and, crucially, still unloadable: no lease is attributed
-    // to the destroyed consumer any more.
+    // to the destroyed consumer any more. A fresh administration lease proves it is intact.
+    admin_lease survivor(r.host(), r.id("provider"), test_contract);
+    check_status("acquire(surviving provider)", survivor.status(), abi::ok);
     abi::binding handle{};
-    check_status("bind(surviving provider)", r.host().bind(r.id("provider"), "echo", &handle),
+    check_status("bind(surviving provider)", r.host().bind(survivor.credential(), "echo", &handle),
                  abi::ok);
+    std::string text;
+    check_status("call(surviving provider)", r.host().call(handle, abi::bytes{"alive", 5}, &text),
+                 abi::ok);
+    CHECK(text == "alive");
     check_status("unbind", r.host().unbind(handle), abi::ok);
+    check_status("release", survivor.release(), abi::ok);
     check_status("unload(provider)", r.host().unload(r.id("provider")), abi::ok);
     CHECK(r.host().plugins().empty());
 
@@ -2045,10 +2335,12 @@ TEST_CASE(circular_leases_are_all_returned_by_shutdown)
 
     fake_plug* a = first.instance();
     fake_plug* b = second.instance();
-    check_status("a borrows b", a->acquire_from(r.id("b")), abi::ok);
-    check_status("b borrows a", b->acquire_from(r.id("a")), abi::ok);
+    check_status("a leases b", a->acquire_from(r.id("b")), abi::ok);
+    check_status("b leases a", b->acquire_from(r.id("a")), abi::ok);
     CHECK(a->holds_lease());
     CHECK(b->holds_lease());
+    check_status("a binds b.echo", a->bind_bound_method(), abi::ok);
+    check_status("b binds a.echo", b->bind_bound_method(), abi::ok);
 
     check_status("shutdown", r.host().shutdown(), abi::ok);
     CHECK(a->revoker.self_ok);

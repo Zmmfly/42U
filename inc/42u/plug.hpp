@@ -19,7 +19,7 @@ public:
     /**
      * @brief Load one trusted library, resolve entry, and negotiate ABI before exposing a factory.
      */
-    abi::v1::status open(const std::filesystem::path& path, std::string& error);
+    abi::v2::status open(const std::filesystem::path& path, std::string& error);
     /**
      * @brief Release the mapping. No instance, interface or function pointer may still be used.
      */
@@ -27,20 +27,20 @@ public:
     /**
      * @brief Get the borrowed negotiated factory, or null for a closed library.
      */
-    abi::v1::iplug_fty* factory() const noexcept { return factory_; }
+    abi::v2::iplug_fty* factory() const noexcept { return factory_; }
     /**
      * @brief Get the canonical loaded path.
      */
     const std::filesystem::path& path() const noexcept { return path_; }
 private:
     void* handle_ = nullptr;
-    abi::v1::iplug_fty* factory_ = nullptr;
+    abi::v2::iplug_fty* factory_ = nullptr;
     std::filesystem::path path_;
 };
 /**
  * @brief Enumerate canonical .u42.so/.u42.dylib/.u42.dll plugin candidates deterministically.
  * @note Nonrecursive. Deduplicate canonical paths; return errors rather than silently skipping IO failures.
  */
-abi::v1::status scan_plugins(const std::filesystem::path& directory,
+abi::v2::status scan_plugins(const std::filesystem::path& directory,
                             std::vector<std::filesystem::path>& out, std::string& error);
 } // namespace u42
