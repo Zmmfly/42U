@@ -13,31 +13,30 @@
 #endif
 
 /**
- * @brief Invoke-only, same-profile C++ plugin ABI with revocable protocol leases.
- * @note ABI v2 is incompatible with v1. Interface declarations use the platform's default packing.
+ * @brief Invoke-only plugin ABI: version-qualified leases authorize calls without bindings.
+ * @note ABI v3 is incompatible with v1/v2. Use the platform's default packing.
  */
-namespace u42::abi::v2 {
+namespace u42::abi::v3 {
 using status = std::uint32_t;
 using method_id = std::uint32_t;
-inline constexpr std::uint32_t abi_major = 2;
+inline constexpr std::uint32_t abi_major = 3;
 inline constexpr status ok = 0, invalid_argument = 1, unsupported = 2,
     not_found = 3, duplicate = 4, invalid_state = 5, busy = 6,
     stale = 7, limit_exceeded = 8, failed = 9, wrong_thread = 10,
     cycle = 11, deferred = 12;
 
 /**
- * @brief A 128-bit identity for a host interface or a business protocol family, never an object.
- * @note Official service identities denote immutable virtual interfaces. Business identities
- *       appear in contract and combine with major/minor to describe data and behavior.
+ * @brief A 128-bit identity for a fixed framework service interface, never a plugin instance.
+ * @note Plugin business compatibility is expressed by plug_id and plugin_version, not an IID.
  */
 struct iid { std::uint64_t high; std::uint64_t low; };
 constexpr bool operator==(iid a, iid b) noexcept { return a.high == b.high && a.low == b.low; }
 constexpr bool operator!=(iid a, iid b) noexcept { return !(a == b); }
-inline constexpr iid events_iid{0x3432555f41424932ULL, 1};
-inline constexpr iid caps_iid{0x3432555f41424932ULL, 2};
-inline constexpr iid calls_iid{0x3432555f41424932ULL, 3};
-inline constexpr iid diag_iid{0x3432555f41424932ULL, 4};
-inline constexpr iid invoke_iid{0x3432555f41424932ULL, 5};
+inline constexpr iid events_iid{0x3432555f41424933ULL, 1};
+inline constexpr iid caps_iid{0x3432555f41424933ULL, 2};
+inline constexpr iid calls_iid{0x3432555f41424933ULL, 3};
+inline constexpr iid diag_iid{0x3432555f41424933ULL, 4};
+inline constexpr iid invoke_iid{0x3432555f41424933ULL, 5};
 
 /**
  * @brief Borrowed bytes, valid only during the current call; null requires size zero.
@@ -50,47 +49,81 @@ struct bytes { const void* data; std::uint64_t size; };
 struct token { std::uint64_t value = 0; };
 
 /**
- * @brief Opaque method binding; zero is invalid. It never silently follows reloads.
+ * @brief Numeric plugin business version, distinct from the framework ABI and instance generation.
+ * @note All unsigned triples, including 0.0.0, are valid. No prerelease or build-tag syntax is
+ *       supported. Providers must version their public data and behavior honestly; the host does
+ *       not infer semantic compatibility from these numbers or preserve state across reloads.
  */
-struct binding { std::uint64_t value = 0; };
+struct plugin_version {
+    std::uint32_t major = 0;
+    std::uint32_t minor = 0;
+    std::uint32_t patch = 0;
+};
 
-/**
- * @brief A plugin-wide business protocol family and its declared compatibility version.
- *
- * @note id must be nonzero and major must be positive for a usable protocol. Equal id and major
- *       with offered minor >= required minor promises backward-compatible data and behavior.
- *       This is a provider declaration, not automatic schema validation or preserved runtime state.
- */
-struct contract { iid id{}; std::uint32_t major = 0; std::uint32_t minor = 0; };
-
-/**
- * @brief Check whether a business protocol is named and versioned.
- * @param value Contract to inspect.
- * @return true for a nonzero identity and positive major version.
- */
-constexpr bool valid_contract(contract value) noexcept
+/** @brief Compare plugin versions for numeric equality. */
+constexpr bool operator==(plugin_version left, plugin_version right) noexcept
 {
-    return (value.id.high != 0 || value.id.low != 0) && value.major != 0;
+    return left.major == right.major && left.minor == right.minor && left.patch == right.patch;
+}
+/** @brief Compare plugin versions for numeric inequality. */
+constexpr bool operator!=(plugin_version left, plugin_version right) noexcept { return !(left == right); }
+
+/**
+ * @brief Order numeric version triples lexicographically without overflow.
+ * @param left First version.
+ * @param right Second version.
+ * @return true when left precedes right by major, then minor, then patch.
+ */
+constexpr bool version_less(plugin_version left, plugin_version right) noexcept
+{
+    return left.major < right.major ||
+           (left.major == right.major && (left.minor < right.minor ||
+            (left.minor == right.minor && left.patch < right.patch)));
 }
 
 /**
- * @brief Test the provider's declared backward compatibility against a consumer requirement.
- * @param offered Provider contract.
- * @param required Consumer contract; minor is the minimum accepted compatible minor.
- * @return true only for valid matching identities/majors and a sufficient offered minor.
+ * @brief Explicit inclusive range [minimum, maximum] of accepted plugin versions.
+ * @note Equal endpoints request an exact version; reversed endpoints are invalid. Crossing a
+ *       major boundary is allowed only when the caller explicitly supplies such a range.
  */
-constexpr bool compatible_contract(contract offered, contract required) noexcept
+struct version_range { plugin_version minimum{}; plugin_version maximum{}; };
+
+/**
+ * @brief Validate inclusive version range ordering.
+ * @param allowed Range supplied by the borrower.
+ * @return true when minimum is not greater than maximum.
+ */
+constexpr bool valid_version_range(version_range allowed) noexcept
 {
-    return valid_contract(offered) && valid_contract(required) && offered.id == required.id &&
-           offered.major == required.major && offered.minor >= required.minor;
+    return !version_less(allowed.maximum, allowed.minimum);
 }
 
 /**
- * @brief Revocable instance lease; deliberately contains no business interface pointer.
- * @note The credential pins one provider generation until release or safe owner cleanup. It never
- *       follows reloads. Business bindings must be created using this credential, not a plug_id.
+ * @brief Check the caller's explicit version bounds, not an inferred compatibility policy.
+ * @param allowed Inclusive accepted range.
+ * @param actual Version copied from the selected instance descriptor.
+ * @return true when the range is valid and contains actual, including both endpoints.
  */
-struct borrow { token credential{}; };
+constexpr bool accepts_version(version_range allowed, plugin_version actual) noexcept
+{
+    return valid_version_range(allowed) && !version_less(actual, allowed.minimum) &&
+           !version_less(allowed.maximum, actual);
+}
+
+/**
+ * @brief Build an exact-version requirement.
+ * @param value The only version to accept.
+ * @return A closed range with both endpoints equal to value.
+ */
+constexpr version_range exact_version(plugin_version value) noexcept { return {value, value}; }
+
+/**
+ * @brief Revocable instance credential and the actual version atomically selected by acquire().
+ * @note Success is status==ok with a nonzero credential; version alone cannot indicate success.
+ *       The value contains no provider pointer. Even identical versions never revive old tokens
+ *       after reload. Every business call uses this credential plus a method name or ID.
+ */
+struct borrow { token credential{}; plugin_version version{}; };
 
 /**
  * @brief Immutable factory metadata, borrowed until the library is unloaded.
@@ -101,7 +134,7 @@ struct plug_desc {
     std::uint32_t struct_size = sizeof(plug_desc);
     std::uint32_t reserved = 0;
     const char* plug_id = nullptr;
-    const char* version = nullptr;
+    plugin_version version{};
     std::int32_t priority = 0;
     std::uint32_t before_count = 0;
     const char* const* before = nullptr;
@@ -121,17 +154,15 @@ struct method_desc {
 };
 
 /**
- * @brief One plugin-wide business protocol and its methods, copied by the host during start().
- * @note struct_size must match this version; null methods require zero method_count. Nonempty
- *       methods require a valid protocol. An entirely zero protocol is allowed only with no
- *       methods and cannot be leased; a valid protocol with no methods may be leased for lifetime.
- *       Partial invalid protocols are rejected. Capabilities stay fixed for this instance.
+ * @brief Complete method announcement, copied by the host during start().
+ * @note struct_size must match this ABI; null methods require zero method_count. Methods stay
+ *       fixed for this instance. Version comes from plug_desc, not a second business contract.
+ *       An Active published instance with no methods may still be leased for lifetime.
  */
 struct caps_desc {
     std::uint32_t struct_size = sizeof(caps_desc);
     std::uint32_t method_count = 0;
     const method_desc* methods = nullptr;
-    contract protocol{};
 };
 
 /**
@@ -142,7 +173,12 @@ struct event { const char* name; bytes payload; };
 /**
  * @brief Capability snapshot/withdrawal; all pointers expire when the callback returns.
  */
-struct cap_event { const char* plug_id; std::uint32_t available; caps_desc capabilities; };
+struct cap_event {
+    const char* plug_id;
+    std::uint32_t available;
+    plugin_version version;
+    caps_desc capabilities;
+};
 
 /**
  * @brief Caller-owned output writer; plugins must not retain it after invoke returns.
@@ -215,7 +251,7 @@ protected:
 };
 
 /**
- * @brief Protocol/method registration, queued discovery, and revocable instance leasing.
+ * @brief Method registration, versioned discovery, and revocable instance leasing.
  */
 struct icaps {
     /**
@@ -231,19 +267,19 @@ struct icaps {
      */
     virtual status U42_CALL unwatch(token value) noexcept = 0;
     /**
-     * @brief Lease an Active instance under an explicitly accepted business protocol.
+     * @brief Lease an Active instance whose version lies within the caller's explicit bounds.
      *
      * @param plug_id Required current provider identity.
-     * @param required Required valid protocol; exact family/major and minimum compatible minor.
+     * @param allowed Required inclusive range; minimum must not exceed maximum.
      * @param receiver Required stable revoker, alive until the credential is returned.
-     * @param[out] out Required output, cleared first; contains only a credential, never a pointer.
-     * @return ok on success; unsupported for incompatible protocols; otherwise an argument/state,
-     *         allocation or thread error. Initialized consumers may lease but cannot call yet.
+     * @param[out] out Required output, cleared first; receives credential and actual version together.
+     * @return ok on success; unsupported if the provider version is outside allowed; otherwise an
+     *         argument/state/allocation/thread error. Initialized consumers may lease but not call.
      */
-    virtual status U42_CALL acquire(const char* plug_id, const contract* required,
+    virtual status U42_CALL acquire(const char* plug_id, const version_range* allowed,
                                     irevoker* receiver, borrow* out) noexcept = 0;
     /**
-     * @brief Return a caller-owned lease and invalidate its bindings; old returns affect no new lease.
+     * @brief Return a caller-owned lease; subsequent calls with it are stale, never a new instance.
      * @note Returns busy while this lease has in-flight calls, including result delivery. Other
      *       failures retain ownership; ok/stale allow the caller to clear the token.
      */
@@ -257,29 +293,30 @@ protected:
  */
 struct icalls {
     /**
-     * @brief Bind a named method using a live caller-owned lease, never a provider pointer.
+     * @brief Resolve and invoke a named method directly under a live caller-owned lease.
+     *
      * @param credential Lease returned by icaps::acquire() for this context.
-     * @param name Required exact method name.
-     * @param[out] out Required binding output, cleared first.
-     * @return ok, stale for a returned lease, or an argument/ownership/state/lookup error.
+     * @param name Required exact method name; empty names are rejected.
+     * @param args Borrowed JSON input for this call; null data requires zero size.
+     * @param result Required caller-owned writer; receives at most one complete bounded result.
+     * @return ok on success; stale for a returned lease; not_found for an unknown method; otherwise
+     *         an argument/ownership/state/reentry/limit error. Initialized consumers cannot call.
+     * @note The host buffers output and discards it if invoke fails. The lease remains owned on
+     *       any invocation failure and cannot be released until output delivery has finished.
      */
-    virtual status U42_CALL bind_name(token credential, const char* name, binding* out) noexcept = 0;
+    virtual status U42_CALL call_name(token credential, const char* name, bytes args,
+                                      iwriter* result) noexcept = 0;
     /**
-     * @brief Bind a numeric method using a live caller-owned lease.
+     * @brief Invoke a published numeric method directly under a live caller-owned lease.
+     *
      * @param credential Lease returned by icaps::acquire() for this context.
-     * @param id Provider-local method ID.
-     * @param[out] out Required binding output, cleared first.
-     * @return ok, stale for a returned lease, or an argument/ownership/state/lookup error.
+     * @param method Provider-local published method ID.
+     * @param args Borrowed JSON input; null data requires zero size.
+     * @param result Required output writer, never retained by the provider.
+     * @return The same lease/state/invocation statuses as call_name().
      */
-    virtual status U42_CALL bind_id(token credential, method_id id, binding* out) noexcept = 0;
-    /**
-     * @brief Invoke synchronously; partial output is discarded when invocation fails.
-     */
-    virtual status U42_CALL call(binding target, bytes args, iwriter* result) noexcept = 0;
-    /**
-     * @brief Release a binding without returning its lease; the lease still pins the provider.
-     */
-    virtual status U42_CALL unbind(binding target) noexcept = 0;
+    virtual status U42_CALL call_id(token credential, method_id method, bytes args,
+                                    iwriter* result) noexcept = 0;
 protected:
     ~icalls() = default;
 };
@@ -370,31 +407,33 @@ protected:
 
 using entry_fn = status (U42_CALL *)(std::uint32_t, iplug_fty**) noexcept;
 inline constexpr const char* entry_name = "u42_get_factory";
-static_assert(sizeof(iid) == 16 && sizeof(token) == 8 && sizeof(binding) == 8);
+static_assert(sizeof(iid) == 16 && sizeof(token) == 8);
+static_assert(sizeof(plugin_version) == 12 && sizeof(version_range) == 24);
+static_assert(std::is_standard_layout_v<plugin_version> && std::is_trivially_copyable_v<borrow>);
 static_assert(std::is_standard_layout_v<plug_desc> && std::is_standard_layout_v<caps_desc>);
 // Enforce the 64-bit native-packing profile at every SDK consumer, not only in host tests.
 #if UINTPTR_MAX == UINT64_MAX
 static_assert(alignof(iid) == 8 && sizeof(bytes) == 16 && alignof(bytes) == 8);
-static_assert(sizeof(borrow) == 8 && alignof(borrow) == 8);
-static_assert(sizeof(contract) == 24 && alignof(contract) == 8);
-static_assert(offsetof(contract, major) == 16 && offsetof(contract, minor) == 20);
-static_assert(sizeof(plug_desc) == 56 && alignof(plug_desc) == 8);
+static_assert(sizeof(borrow) == 24 && alignof(borrow) == 8 && offsetof(borrow, version) == 8);
+static_assert(alignof(plugin_version) == 4 && alignof(version_range) == 4);
+static_assert(sizeof(plug_desc) == 64 && alignof(plug_desc) == 8);
 static_assert(offsetof(plug_desc, plug_id) == 8 && offsetof(plug_desc, version) == 16);
-static_assert(offsetof(plug_desc, priority) == 24 && offsetof(plug_desc, before) == 32);
-static_assert(offsetof(plug_desc, after_count) == 40 && offsetof(plug_desc, after) == 48);
+static_assert(offsetof(plug_desc, priority) == 28 && offsetof(plug_desc, before) == 40);
+static_assert(offsetof(plug_desc, after_count) == 48 && offsetof(plug_desc, after) == 56);
 static_assert(sizeof(method_desc) == 40 && offsetof(method_desc, name) == 8);
-static_assert(sizeof(caps_desc) == 40 && alignof(caps_desc) == 8);
-static_assert(offsetof(caps_desc, methods) == 8 && offsetof(caps_desc, protocol) == 16);
-static_assert(sizeof(event) == 24 && sizeof(cap_event) == 56);
+static_assert(sizeof(caps_desc) == 16 && alignof(caps_desc) == 8);
+static_assert(offsetof(caps_desc, methods) == 8);
+static_assert(sizeof(event) == 24 && sizeof(cap_event) == 40);
+static_assert(offsetof(cap_event, version) == 12 && offsetof(cap_event, capabilities) == 24);
 static_assert(sizeof(iplug) == sizeof(void*) && sizeof(ictx) == sizeof(void*));
 #endif
-} // namespace u42::abi::v2
+} // namespace u42::abi::v3
 
 /**
  * @brief Entry declaration; plugin definitions add U42_EXPORT, host consumers do not export it.
- * @param major Requested profile-compatible ABI major, currently 2; v1 layouts are incompatible.
+ * @param major Requested profile-compatible ABI major, currently 3; v1/v2 layouts are incompatible.
  * @param out Library-owned factory; must be cleared on failure.
  * @return ok if supported, otherwise unsupported or invalid_argument.
  */
-extern "C" u42::abi::v2::status U42_CALL u42_get_factory(
-    std::uint32_t major, u42::abi::v2::iplug_fty** out) noexcept;
+extern "C" u42::abi::v3::status U42_CALL u42_get_factory(
+    std::uint32_t major, u42::abi::v3::iplug_fty** out) noexcept;

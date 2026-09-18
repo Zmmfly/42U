@@ -58,7 +58,7 @@ public:
      *                including process-lifetime retention if safe teardown fails.
      * @return ok when staged; busy inside a plugin callback; otherwise the staging error.
      */
-    abi::v2::status add(abi::v2::iplug_fty* factory);
+    abi::v3::status add(abi::v3::iplug_fty* factory);
     /**
      * @brief Scan and eagerly stage every candidate before initialization, then start the batch.
      *
@@ -69,7 +69,7 @@ public:
      *       Startup has the same deferred-unload boundary as start(). Scan/staging failure only
      *       rolls back newly scanned records; cleanup is best effort under allocation failure.
      */
-    abi::v2::status boot(const std::filesystem::path& directory);
+    abi::v3::status boot(const std::filesystem::path& directory);
     /**
      * @brief Initialize all staged plugins before starting any, using a deterministic plan.
      *
@@ -82,7 +82,7 @@ public:
      *       is best effort: allocation failure before planning or during rollback may leave Created
      *       or quarantined records for retry/shutdown; failed is not a strong rollback guarantee.
      */
-    abi::v2::status start();
+    abi::v3::status start();
     /**
      * @brief Hot-load one library; existing after constraints may be satisfied, before may not.
      *
@@ -91,7 +91,7 @@ public:
      * @note Starts all Created instances, using start() semantics. Failed cleanup can leave staged
      *       or quarantined records for later shutdown(); failure is not an unconditional rollback.
      */
-    abi::v2::status load(const std::filesystem::path& path);
+    abi::v3::status load(const std::filesystem::path& path);
     /**
      * @brief Revoke, stop and unload an instance; unreturned leases make this fail safely.
      *
@@ -102,7 +102,7 @@ public:
      *       poll() after it returns provides a safe point. Explicit unload can satisfy a request.
      *       Requests disappear with their instance and never target a later same-ID replacement.
      */
-    abi::v2::status unload(const std::string& plug_id);
+    abi::v3::status unload(const std::string& plug_id);
     /**
      * @brief Withdraw capabilities, request lease returns, then stop in reverse initialization order.
      *
@@ -112,7 +112,7 @@ public:
      *       entry points even if cleanup fails. Failed consumers retain their outgoing borrowings,
      *       potentially retaining their providers too; failed stop() is not automatically retried.
      */
-    abi::v2::status shutdown();
+    abi::v3::status shutdown();
     /**
      * @brief Dispatch queued events/notifications and deferred unloads at a safe point.
      *
@@ -124,99 +124,87 @@ public:
      *       Internal allocation exceptions provide only best-effort queue retention. After failed,
      *       explicitly retry unload(plug_id) rather than assuming the request is still queued.
      */
-    abi::v2::status poll();
+    abi::v3::status poll();
     /**
-     * @brief Discover the currently published business protocol without acquiring a lease.
+     * @brief Discover an Active published instance's current version without leasing it.
      *
      * @param plug_id Current provider identity.
      * @param[out] out Required output, cleared first on the control thread.
-     * @return ok for an Active provider with a valid protocol; otherwise a lookup/state error.
-     * @note Discovery is not compatibility acceptance or a lifetime lock. Stateful consumers
-     *       must supply their own expected protocol to acquire(), not blindly copy this result.
+     * @return ok on discovery, otherwise a lookup/state/argument error.
+     * @note This is not a lifetime lock or compatibility acceptance. Stateful consumers should
+     *       acquire with their own allowed range and use the version returned with that lease.
      */
-    abi::v2::status protocol(const std::string& plug_id, abi::v2::contract* out);
+    abi::v3::status version(const std::string& plug_id, abi::v3::plugin_version* out);
     /**
-     * @brief Acquire an administration-owned, revocable lease on one compatible provider instance.
+     * @brief Acquire an administration-owned lease and atomically return the actual plugin version.
      *
      * @param plug_id Current provider identity.
-     * @param required Expected protocol family/major and minimum compatible minor.
-     * @param receiver Required stable revoker, kept alive until successful lease return.
-     * @param[out] out Required output, cleared on the control thread; contains no interface pointer.
-     * @return ok, unsupported for incompatible contracts, or an argument/state/allocation error.
-     * @note The lease pins one generation. Reacquire after reload and reconstruct dependent state.
+     * @param allowed Inclusive numeric version range; equal endpoints mean an exact version.
+     * @param receiver Required stable revoker, alive until the lease is successfully returned.
+     * @param[out] out Required output, cleared on the control thread; contains credential and version.
+     * @return ok, unsupported for an out-of-range version, or an argument/state/allocation error.
+     * @note The credential pins one generation. Reacquire and rebuild state after every reload,
+     *       including a reload of exactly the same version. No provider pointer is returned.
      */
-    abi::v2::status acquire(const std::string& plug_id, const abi::v2::contract& required,
-                            abi::v2::irevoker* receiver, abi::v2::borrow* out);
+    abi::v3::status acquire(const std::string& plug_id, const abi::v3::version_range& allowed,
+                            abi::v3::irevoker* receiver, abi::v3::borrow* out);
     /**
-     * @brief Return an administration-owned lease and invalidate all of its method bindings.
+     * @brief Return an administration-owned lease, proactively or in response to revocation.
      *
-     * @param credential Nonzero lease credential issued by acquire().
-     * @return ok after return; stale if already gone; busy during a call on this lease;
-     *         otherwise an argument/ownership/thread error, retaining the lease on refusal.
+     * @param credential Nonzero credential issued by acquire().
+     * @return ok after return; stale if already gone; busy while this lease has an in-flight call;
+     *         otherwise an argument/ownership/thread error. Refusal does not drop the lease.
      */
-    abi::v2::status release(abi::v2::token credential);
+    abi::v3::status release(abi::v3::token credential);
     /**
-     * @brief Bind a named method under a live administration-owned lease.
+     * @brief Resolve a method name and invoke it directly under an administration-owned lease.
      *
-     * @param credential Lease issued by acquire(), fixing the provider instance and protocol.
-     * @param method Exact published method name.
-     * @param[out] out Required output, cleared on the control thread.
-     * @return ok, stale for an expired lease, or an argument/ownership/state/lookup error.
-     */
-    abi::v2::status bind(abi::v2::token credential, const std::string& method,
-                         abi::v2::binding* out);
-    /**
-     * @brief Bind a numeric method under a live administration-owned lease.
-     *
-     * @param credential Lease issued by acquire().
-     * @param method Provider-local method ID.
-     * @param[out] out Required output, cleared on the control thread.
-     * @return ok, stale for an expired lease, or an argument/ownership/state/lookup error.
-     */
-    abi::v2::status bind(abi::v2::token credential, abi::v2::method_id method,
-                         abi::v2::binding* out);
-    /**
-     * @brief Release a binding without releasing its lease or unlocking the provider.
-     *
-     * @param value Nonzero administration-owned binding.
-     * @return ok if released; stale if already invalidated; otherwise an argument/ownership error.
-     */
-    abi::v2::status unbind(abi::v2::binding value);
-    /**
-     * @brief Invoke through the host gateway with lease, owner, generation and state checks.
-     *
-     * @param target Administration-owned binding backed by a still-live lease.
+     * @param credential Live lease issued by acquire().
+     * @param method Exact published method name; must not alias *out.
      * @param args Borrowed input; null data requires zero size; must not refer into *out.
-     * @param[out] out Required string, cleared on the control thread. Partial output is discarded.
-     * @return ok with complete output; stale after lease return/reload; otherwise a call error.
+     * @param[out] out Required string, cleared on the control thread; partial output is discarded.
+     * @return ok, stale for an expired lease, not_found for an unknown method, or a call error.
      */
-    abi::v2::status call(abi::v2::binding target, abi::v2::bytes args, std::string* out);
+    abi::v3::status call(abi::v3::token credential, const std::string& method,
+                         abi::v3::bytes args, std::string* out);
     /**
-     * @brief One-shot administration call using an explicit protocol and a temporary lease.
+     * @brief Invoke a numeric method directly under an administration-owned lease.
+     *
+     * @param credential Live lease issued by acquire().
+     * @param method Provider-local published method ID.
+     * @param args Borrowed input; null data requires zero size; must not refer into *out.
+     * @param[out] out Required string, cleared on the control thread; partial output is discarded.
+     * @return The same lease/state/invocation statuses as the named form.
+     */
+    abi::v3::status call(abi::v3::token credential, abi::v3::method_id method,
+                         abi::v3::bytes args, std::string* out);
+    /**
+     * @brief One-shot administration call using explicit version bounds and a temporary lease.
      *
      * @param plug_id Current provider identity; must not alias *out.
-     * @param required Explicitly accepted protocol; never inferred from plugin release version.
-     * @param method Exact method name; must not alias *out.
+     * @param allowed Explicit inclusive accepted version range, never silently broadened.
+     * @param method Exact published method name; must not alias *out.
      * @param args Borrowed input; null data requires zero size; must not refer into *out.
      * @param[out] out Required output, cleared before validation on the control thread.
-     * @return ok with complete output; otherwise a compatibility/lookup/invocation/output error.
-     * @note Acquires, binds, calls, unbinds and returns the lease synchronously. This does not
-     *       preserve provider sessions across calls; use an explicit lease for stateful work.
+     * @return ok with complete output; otherwise a version/lookup/invocation/output error.
+     * @note Acquires, calls and returns the lease synchronously; there is no binding. This does
+     *       not preserve sessions across calls. Use acquire() explicitly when state or selection
+     *       of input format based on the returned version matters.
      */
-    abi::v2::status call(const std::string& plug_id, const abi::v2::contract& required,
-                         const std::string& method, abi::v2::bytes args, std::string* out);
+    abi::v3::status call(const std::string& plug_id, const abi::v3::version_range& allowed,
+                         const std::string& method, abi::v3::bytes args, std::string* out);
     /**
-     * @brief Numeric form of the explicit-protocol one-shot administration call.
+     * @brief Numeric form of the explicit-version one-shot administration call.
      *
      * @param plug_id Current provider identity; must not alias *out.
-     * @param required Explicitly accepted protocol family/major and minimum compatible minor.
-     * @param method Provider-local method ID.
+     * @param allowed Explicit inclusive version range.
+     * @param method Provider-local published method ID.
      * @param args Borrowed input; null data requires zero size; must not refer into *out.
      * @param[out] out Required output, cleared before validation on the control thread.
-     * @return ok with complete output; otherwise a compatibility/lookup/invocation/output error.
+     * @return ok with complete output; otherwise a version/lookup/invocation/output error.
      */
-    abi::v2::status call(const std::string& plug_id, const abi::v2::contract& required,
-                         abi::v2::method_id method, abi::v2::bytes args, std::string* out);
+    abi::v3::status call(const std::string& plug_id, const abi::v3::version_range& allowed,
+                         abi::v3::method_id method, abi::v3::bytes args, std::string* out);
     /**
      * @brief Current plugin identities, including staged and quarantined instances.
      *

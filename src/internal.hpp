@@ -13,7 +13,7 @@
 #include <vector>
 
 namespace u42::detail {
-namespace a = abi::v2;
+namespace a = abi::v3;
 struct engine;
 struct record;
 enum class phase { created, initializing, initialized, starting, active, revoking, stopped, faulted };
@@ -22,7 +22,6 @@ struct owned_method {
     std::string name, description, input_schema, output_schema;
 };
 struct capability_set {
-    a::contract protocol{};
     std::vector<owned_method> methods;
 };
 
@@ -40,12 +39,10 @@ struct context final : a::ictx, a::ievents, a::icaps, a::icalls, a::idiag {
     a::status U42_CALL announce(const a::caps_desc*) noexcept override;
     a::status U42_CALL watch(a::icap_sink*, a::token*) noexcept override;
     a::status U42_CALL unwatch(a::token) noexcept override;
-    a::status U42_CALL acquire(const char*, const a::contract*, a::irevoker*, a::borrow*) noexcept override;
+    a::status U42_CALL acquire(const char*, const a::version_range*, a::irevoker*, a::borrow*) noexcept override;
     a::status U42_CALL release(a::token) noexcept override;
-    a::status U42_CALL bind_name(a::token, const char*, a::binding*) noexcept override;
-    a::status U42_CALL bind_id(a::token, a::method_id, a::binding*) noexcept override;
-    a::status U42_CALL call(a::binding, a::bytes, a::iwriter*) noexcept override;
-    a::status U42_CALL unbind(a::binding) noexcept override;
+    a::status U42_CALL call_name(a::token, const char*, a::bytes, a::iwriter*) noexcept override;
+    a::status U42_CALL call_id(a::token, a::method_id, a::bytes, a::iwriter*) noexcept override;
     void U42_CALL log(const char*) noexcept override;
 };
 
@@ -55,7 +52,7 @@ struct record {
     a::iplug* instance = nullptr;
     std::unique_ptr<context> ctx;
     order_node order;
-    std::string version;
+    a::plugin_version version{};
     std::uint64_t generation = 0;
     phase state = phase::created;
     std::size_t depth = 0;
@@ -70,16 +67,9 @@ struct lease_record {
     record* consumer;
     record* provider;
     std::uint64_t generation;
-    a::contract protocol;
+    a::plugin_version version;
     a::irevoker* receiver;
     std::size_t active_calls = 0;
-};
-struct bound_method {
-    record* consumer;
-    std::string provider;
-    std::uint64_t generation;
-    a::method_id method;
-    a::token credential{};
 };
 struct queued_event { std::string name; std::string payload; };
 struct cap_notice {
@@ -87,6 +77,7 @@ struct cap_notice {
     std::string provider;
     std::uint64_t generation;
     bool available;
+    a::plugin_version version{};
     capability_set capabilities;
 };
 
@@ -98,7 +89,6 @@ struct engine {
     std::map<std::uint64_t, event_subscription> subscriptions;
     std::map<std::uint64_t, cap_subscription> watches;
     std::map<std::uint64_t, lease_record> leases;
-    std::map<std::uint64_t, bound_method> bindings;
     std::deque<queued_event> events;
     std::deque<cap_notice> notices;
     std::deque<std::string> deferred_unloads;

@@ -10,7 +10,7 @@
  *
  * Build (links the whole library, like the other tests):
  *   g++ -std=c++17 -Wall -Wextra -Werror -Iinc -Isrc src/context.cc src/events.cc src/host.cc \
- *       src/order.cc src/plug.cc tests/withdraw_test.cc -o build/invoke-v2/events/withdraw_test \
+ *       src/order.cc src/plug.cc tests/withdraw_test.cc -o build/invoke-v3/events/withdraw_test \
  *       -ldl -pthread
  *
  * @note NDEBUG is defined deliberately so CHECK never collapses into assert().
@@ -157,11 +157,10 @@ void operator delete[](void* memory, std::size_t, std::align_val_t) noexcept { s
 
 namespace {
 
-namespace abi = u42::abi::v2;
+namespace abi = u42::abi::v3;
 
-/** @brief Protocol the provider fixture announces: a valid family carried by every notice. */
-constexpr abi::iid provider_protocol_id{0x1234, 0x5678};
-constexpr abi::contract provider_protocol{provider_protocol_id, 1u, 0u};
+/** @brief Version the provider fixture publishes; every notice must carry this generation. */
+constexpr abi::plugin_version provider_version{2, 1, 7};
 using u42::host_options;
 using u42::detail::cap_notice;
 using u42::detail::cap_subscription;
@@ -219,8 +218,8 @@ struct fixture {
      * @param watch_count Number of registered watches that must each receive a notice.
      * @param published Whether the provider currently offers capabilities.
      * @note Every string is longer than the small-string buffer and the capability set holds one
-     *       protocol and one method, so each queued notice performs several real allocations
-     *       and the injector has many addressable failure points inside withdraw().
+     *       method, so each queued notice performs several real allocations and the injector has
+     *       many addressable failure points inside withdraw().
      */
     explicit fixture(std::size_t watch_count, bool published = true) : runtime(host_options{})
     {
@@ -228,6 +227,7 @@ struct fixture {
         const std::string id = "com.example.provider.withdrawal";
         item->order.plug_id = id;
         item->generation = 7;
+        item->version = provider_version;
         item->state = phase::active;
         item->published = published;
         u42::detail::owned_method method;
@@ -236,7 +236,6 @@ struct fixture {
         method.description = "deterministic allocation probe for withdraw";
         method.input_schema = "{\"type\":\"object\",\"title\":\"probe-input\"}";
         method.output_schema = "{\"type\":\"object\",\"title\":\"probe-output\"}";
-        item->capabilities.protocol = provider_protocol;
         item->capabilities.methods.push_back(std::move(method));
         provider = item.get();
         runtime.records.emplace(id, std::move(item));
@@ -317,9 +316,10 @@ void test_success_and_idempotence()
         CHECK(note.provider == probe.provider->order.plug_id);
         CHECK(note.generation == probe.provider->generation);
         CHECK(!note.available);
-        CHECK(note.capabilities.protocol.id == provider_protocol_id);
-        CHECK(note.capabilities.protocol.major == provider_protocol.major);
-        CHECK(abi::valid_contract(note.capabilities.protocol));
+        // The queued snapshot carries the withdrawn generation's own version, copied from the
+        // record metadata at queue time and never a later same-name instance's version.
+        CHECK(note.version == provider_version);
+        CHECK(note.version == probe.provider->version);
         CHECK(note.capabilities.methods.size() == 1);
     }
     const abi::status repeated = probe.runtime.withdraw(*probe.provider);

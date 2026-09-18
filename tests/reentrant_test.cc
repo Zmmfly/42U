@@ -8,11 +8,12 @@
  * tear the instance down exactly once, and the host must not keep replaying a request that can
  * no longer be satisfied.
  *
- * Migrated to ABI v2 (contract lease + invoke-only): a provider discloses one plugin-wide
- * contract and answers query(invoke_iid); a business call is always an explicit contract lease
- * plus a lease-bound method invocation through the host gateway. The native trigger therefore
- * takes an explicit `abi::contract` and a stable revoker, binds with the credential that
- * `host.acquire()` returned, and only then calls. No provider pointer is ever held.
+ * Migrated to ABI v3 (typed version lease + direct calls): a provider publishes a numeric
+ * plugin_version and a method set and answers query(invoke_iid); a business call is always an
+ * explicit version range lease plus a direct call through the host call path, by method name or
+ * numeric id, using the credential that `host.acquire()` returned. The binding layer is gone, so
+ * the native trigger keeps a stable revoker alive until the credential is returned and never
+ * holds a provider pointer.
  *
  * Four contracts are pinned here against the real host implementation (every src source):
  *
@@ -26,7 +27,7 @@
  *     instead of failing forever.
  *  3. A request queued from an availability callback stays pending until start() returns and
  *     is served exactly once at a later safe point.
- *  4. A provider whose contract lease is not returned stays revoking (no stop, no destroy)
+ *  4. A provider whose version lease is not returned stays revoking (no stop, no destroy)
  *     and becomes unloadable as soon as the credential comes back.
  *
  * The remaining checks pin the reentrancy boundaries around the same hazard:
@@ -44,8 +45,8 @@
  *
  * Build and run (real sources plus sanitizers), from the project root:
  *
- *   g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinc -Isrc tests/reentrant_test.cc src/context.cc src/events.cc src/host.cc src/order.cc src/plug.cc -o build/invoke-v2/reentrant -ldl -pthread
- *   ./build/invoke-v2/reentrant
+ *   g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinc -Isrc tests/reentrant_test.cc src/context.cc src/events.cc src/host.cc src/order.cc src/plug.cc -o build/invoke-v3/safety/reentrant -ldl -pthread
+ *   ./build/invoke-v3/safety/reentrant
  *
  * The test owns its main() and depends only on <42u/abi.hpp> and <42u/host.hpp>. Each fake owns
  * its instance, so a plugin-side destroy() does not free the object and the stop()/destroy()
@@ -68,7 +69,7 @@
 
 namespace {
 
-namespace abi = u42::abi::v2;
+namespace abi = u42::abi::v3;
 
 /* ------------------------------------------------------------------ *
  * Test harness
@@ -98,12 +99,13 @@ std::size_t g_failures = 0;
         if (!(condition)) fail_check(#condition, __FILE__, __LINE__);                \
     } while (false)
 
-/** @brief Business protocol family the provider fakes disclose during start(). */
-inline constexpr abi::iid k_protocol_id{0x3432555f52454e54ULL, 0x2ULL};
-/** @brief The valid contract a consumer must accept to lease those providers. */
-inline constexpr abi::contract k_contract{k_protocol_id, 1u, 0u};
-/** @brief Numeric id of the single advertised method. */
+/** @brief Plugin business version every provider fake publishes during describe(). */
+inline constexpr abi::plugin_version k_provider_version{1, 0, 0};
+/** @brief Exact version range a consumer must accept to lease those providers. */
+inline constexpr abi::version_range k_required = abi::exact_version(k_provider_version);
+/** @brief Numeric ids of the two methods a callable provider fake publishes. */
 inline constexpr abi::method_id k_ping = 1;
+inline constexpr abi::method_id k_echo = 2;
 
 /* ------------------------------------------------------------------ *
  * Fakes
@@ -113,10 +115,10 @@ class re_factory;
 
 /** @brief Behavior switches of one fake plugin instance. */
 struct re_behavior {
-    /** Advertise a business contract during start(). */
+    /** Advertise capabilities during start(). */
     bool announce = false;
-    /** Contract disclosed to consumers when @ref announce is set. */
-    abi::contract protocol = k_contract;
+    /** Plugin business version published by describe() when @ref announce is set. */
+    abi::plugin_version version = k_provider_version;
     /** Also advertise one callable method ("ping"), making this instance a callable provider. */
     bool announce_method = false;
     /** Register a capability watch during init(). */
@@ -146,8 +148,8 @@ struct re_behavior {
     /** Identity the reentrant unload requests and the lease refer to. */
     std::string unload_target;
     std::string acquire_target;
-    /** Contract this consumer requires when it leases @ref acquire_target. */
-    abi::contract required_protocol = k_contract;
+    /** Inclusive version range this consumer requires for @ref acquire_target. */
+    abi::version_range required = k_required;
     /** Never return the lease credential from on_revoke(); the test clears this to release it. */
     bool hold_lease = false;
     /** Hard initialization edges, used to build a rejected (cyclic) plan. */
@@ -277,7 +279,6 @@ public:
 
 private:
     std::string plug_id_;
-    std::string version_ = "1.0";
     re_behavior behavior_;
     abi::plug_desc desc_{};
     std::vector<std::string> before_;
@@ -285,7 +286,10 @@ private:
     std::vector<const char*> before_ptrs_;
     std::vector<const char*> after_ptrs_;
     std::string method_name_ = "ping";
+    std::string echo_name_ = "echo";
     abi::method_desc method_desc_{};
+    abi::method_desc echo_desc_{};
+    std::vector<abi::method_desc> methods_;
     abi::caps_desc caps_{};
     std::unique_ptr<re_plug> instance_;
 };
@@ -314,7 +318,7 @@ re_factory::re_factory(std::string plug_id, re_behavior behavior)
     desc_.struct_size = sizeof(abi::plug_desc);
     desc_.reserved = 0;
     desc_.plug_id = plug_id_.c_str();
-    desc_.version = version_.c_str();
+    desc_.version = behavior_.version;
     desc_.priority = behavior_.priority;
     desc_.before_count = static_cast<std::uint32_t>(before_ptrs_.size());
     desc_.before = before_ptrs_.empty() ? nullptr : before_ptrs_.data();
@@ -326,11 +330,16 @@ re_factory::re_factory(std::string plug_id, re_behavior behavior)
     method_desc_.description = "queues a reentrant unload request";
     method_desc_.input_schema = "{}";
     method_desc_.output_schema = "{}";
+    echo_desc_.id = k_echo;
+    echo_desc_.name = echo_name_.c_str();
+    echo_desc_.description = "second published probe method";
+    echo_desc_.input_schema = "{}";
+    echo_desc_.output_schema = "{}";
+    methods_ = {method_desc_, echo_desc_};
 
     caps_.struct_size = sizeof(abi::caps_desc);
-    caps_.protocol = behavior_.protocol;
-    caps_.method_count = behavior_.announce_method ? 1u : 0u;
-    caps_.methods = behavior_.announce_method ? &method_desc_ : nullptr;
+    caps_.method_count = behavior_.announce_method ? static_cast<std::uint32_t>(methods_.size()) : 0u;
+    caps_.methods = behavior_.announce_method ? methods_.data() : nullptr;
 }
 
 abi::status U42_CALL re_factory::describe(const abi::plug_desc** out) noexcept
@@ -482,7 +491,7 @@ abi::status re_plug::acquire_now()
     if (ctx_->query(&abi::caps_iid, &service) != abi::ok || service == nullptr) return abi::invalid_state;
     caps_ = static_cast<abi::icaps*>(service);
     const re_behavior& behavior = owner_.behavior();
-    const abi::contract required = behavior.required_protocol;
+    const abi::version_range required = behavior.required;
     const abi::status status =
         caps_->acquire(behavior.acquire_target.c_str(), &required, &revoker_, &lease_);
     held_lease = status == abi::ok && lease_.credential.value != 0;
@@ -517,7 +526,7 @@ re_behavior provider_behavior()
 {
     re_behavior behavior;
     behavior.announce = true;
-    behavior.protocol = k_contract;
+    behavior.version = k_provider_version;
     return behavior;
 }
 
@@ -549,19 +558,21 @@ void invocation_request_then_safe_point()
 
     host_revoker revoker(&host);
     abi::borrow lease{};
-    abi::binding binding{};
-    CHECK(host.acquire("invoke.provider", k_contract, &revoker, &lease) == abi::ok &&
-          host.bind(lease.credential, "ping", &binding) == abi::ok);
-    CHECK(binding.value != 0);
+    CHECK(host.acquire("invoke.provider", k_required, &revoker, &lease) == abi::ok);
+    CHECK(lease.credential.value != 0);
+    CHECK(lease.version == k_provider_version);
     std::string output;
-    CHECK(host.call(binding, abi::bytes{nullptr, 0}, &output) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::ok);
     CHECK(provider->invoke_calls == 1);
     CHECK(provider->unload_requests.size() == 1);
     CHECK(provider->unload_requests.front() == abi::deferred);
     CHECK(provider->request_exceptions == 0);
     CHECK(provider->stop_calls == 0);
     CHECK(provider->destroy_calls == 0);
-    CHECK(host.unbind(binding) == abi::ok && host.release(lease.credential) == abi::ok);
+    // The direct call is the whole business path; a released credential stays stale by name and id.
+    CHECK(host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::stale);
+    CHECK(host.call(lease.credential, k_ping, abi::bytes{nullptr, 0}, &output) == abi::stale);
 
     // Safe point: retry the identity that is still queued. One teardown, no re-entry.
     CHECK(host.unload("invoke.provider") == abi::ok);
@@ -752,12 +763,12 @@ void in_callback_shutdown_is_refused()
 
     host_revoker revoker(&host);
     abi::borrow lease{};
-    abi::binding binding{};
-    CHECK(host.acquire("shutdown.provider", k_contract, &revoker, &lease) == abi::ok &&
-          host.bind(lease.credential, "ping", &binding) == abi::ok);
+    CHECK(host.acquire("shutdown.provider", k_required, &revoker, &lease) == abi::ok);
     std::string output;
-    CHECK(host.call(binding, abi::bytes{nullptr, 0}, &output) == abi::ok);
-    CHECK(host.unbind(binding) == abi::ok && host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::ok);
+    CHECK(host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::stale);
+    CHECK(host.call(lease.credential, k_ping, abi::bytes{nullptr, 0}, &output) == abi::stale);
 
     CHECK(provider->shutdown_requests.size() == 1);
     CHECK(provider->shutdown_requests.front() == abi::busy);
@@ -826,13 +837,13 @@ void stale_deferred_request_dies_with_its_identity()
 
     host_revoker revoker(&host);
     abi::borrow lease{};
-    abi::binding binding{};
-    CHECK(host.acquire("gen.a", k_contract, &revoker, &lease) == abi::ok &&
-          host.bind(lease.credential, "ping", &binding) == abi::ok);
+    CHECK(host.acquire("gen.a", k_required, &revoker, &lease) == abi::ok);
     std::string output;
-    CHECK(host.call(binding, abi::bytes{nullptr, 0}, &output) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::ok);
     CHECK(replacement->invoke_calls == 1);
-    CHECK(host.unbind(binding) == abi::ok && host.release(lease.credential) == abi::ok);
+    CHECK(host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::stale);
+    CHECK(host.call(lease.credential, k_ping, abi::bytes{nullptr, 0}, &output) == abi::stale);
     CHECK(host.shutdown() == abi::ok);
     CHECK(replacement->destroy_calls == 1);
 }
@@ -858,12 +869,12 @@ void unknown_request_is_not_queued()
 
     host_revoker revoker(&host);
     abi::borrow lease{};
-    abi::binding binding{};
-    CHECK(host.acquire("ghost.provider", k_contract, &revoker, &lease) == abi::ok &&
-          host.bind(lease.credential, "ping", &binding) == abi::ok);
+    CHECK(host.acquire("ghost.provider", k_required, &revoker, &lease) == abi::ok);
     std::string output;
-    CHECK(host.call(binding, abi::bytes{nullptr, 0}, &output) == abi::ok);
-    CHECK(host.unbind(binding) == abi::ok && host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::ok);
+    CHECK(host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::stale);
+    CHECK(host.call(lease.credential, k_ping, abi::bytes{nullptr, 0}, &output) == abi::stale);
 
     CHECK(provider->unload_requests.size() == 1);
     CHECK(provider->unload_requests.front() == abi::not_found);
@@ -904,12 +915,15 @@ void structural_changes_are_refused_inside_callbacks()
 
     host_revoker revoker(&host);
     abi::borrow lease{};
-    abi::binding binding{};
-    CHECK(host.acquire("struct.provider", k_contract, &revoker, &lease) == abi::ok &&
-          host.bind(lease.credential, "ping", &binding) == abi::ok);
+    CHECK(host.acquire("struct.provider", k_required, &revoker, &lease) == abi::ok);
     std::string output;
-    CHECK(host.call(binding, abi::bytes{nullptr, 0}, &output) == abi::ok);
-    CHECK(host.unbind(binding) == abi::ok && host.release(lease.credential) == abi::ok);
+    // One credential reaches every published method: by name and by numeric id.
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::ok);
+    CHECK(host.call(lease.credential, k_echo, abi::bytes{nullptr, 0}, &output) == abi::ok);
+    CHECK(host.call(lease.credential, "missing", abi::bytes{nullptr, 0}, &output) == abi::not_found);
+    CHECK(host.release(lease.credential) == abi::ok);
+    CHECK(host.call(lease.credential, "ping", abi::bytes{nullptr, 0}, &output) == abi::stale);
+    CHECK(host.call(lease.credential, k_ping, abi::bytes{nullptr, 0}, &output) == abi::stale);
 
     CHECK(provider->add_status == abi::busy);
     CHECK(provider->load_status == abi::busy);

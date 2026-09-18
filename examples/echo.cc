@@ -7,7 +7,7 @@
  * An instance implements exactly two roles: iplug for the host lifecycle and iinvoke for
  * host-dispatched methods. Both are host-private entries, so this provider publishes no business
  * interface at all; a consumer reaches these methods only through the host gateway after
- * acquiring a lease on example::echo_contract.
+ * acquiring a version-qualified lease on this plugin.
  *
  * The instance needs no host implementation, owns no threads and registers no callbacks, so
  * init/start/stop stay trivial and synchronous.
@@ -39,9 +39,6 @@ constexpr std::uint32_t count_of(const element (&)[size]) noexcept
 /// @brief Canonical plugin identity announced to the host.
 constexpr char echo_plug_id[] = "com.example.echo";
 
-/// @brief Human-readable plugin release version; the business protocol version is separate.
-constexpr char echo_version[] = "1.0.0";
-
 /// @brief Published name of the verbatim echo method (number example::echo_method_id).
 constexpr char echo_method_name[] = "echo";
 
@@ -66,7 +63,7 @@ constexpr char fail_input_schema[] = "{\"type\":\"object\"}";
 /// @brief Output schema of the deliberate failure method.
 constexpr char fail_output_schema[] = "{\"type\":\"object\"}";
 
-/// @brief Methods published with example::echo_contract through icaps::announce during start().
+/// @brief Methods announced through icaps::announce during start(); the version travels in plug_desc.
 const a::method_desc announced_methods[]{
     {example::echo_method_id, echo_method_name, echo_method_description, echo_input_schema,
      echo_output_schema},
@@ -74,9 +71,10 @@ const a::method_desc announced_methods[]{
      fail_output_schema},
 };
 
-/// @brief Immutable factory metadata borrowed by the host until the library unloads.
+/// @brief Immutable factory metadata, including the typed plugin version, borrowed until unload.
 const a::plug_desc echo_plug_description{static_cast<std::uint32_t>(sizeof(a::plug_desc)), 0u,
-                                         echo_plug_id, echo_version, 0, 0u, nullptr, 0u, nullptr};
+                                         echo_plug_id, example::echo_version, 0, 0u, nullptr, 0u,
+                                         nullptr};
 
 /**
  * @brief Forward plugin output through a caller-owned writer with strict validation.
@@ -164,7 +162,7 @@ a::status U42_CALL echo_plugin::init(a::ictx* ctx) noexcept
 }
 
 /**
- * @brief Publish example::echo_contract together with its two synchronous methods.
+ * @brief Announce the two synchronous methods; the typed version already travels in plug_desc.
  *
  * @retval ok The complete capability set was announced.
  * @retval invalid_state The instance was not initialized or was already started.
@@ -176,8 +174,7 @@ a::status U42_CALL echo_plugin::start() noexcept
     if (announced_) return a::invalid_state;
     try {
         const a::caps_desc capabilities{static_cast<std::uint32_t>(sizeof(a::caps_desc)),
-                                        count_of(announced_methods), announced_methods,
-                                        example::echo_contract};
+                                        count_of(announced_methods), announced_methods};
         const a::status status = caps_->announce(&capabilities);
         if (status != a::ok) return status;
     } catch (...) {

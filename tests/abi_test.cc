@@ -3,25 +3,34 @@
  * @brief Independent, dependency-free verification of the frozen contract in @c 42u/abi.hpp.
  *
  * The file owns its main() and links against nothing beyond the standard library, so it can be
- * built with either compiler without the host, spdlog, asio or fmt:
+ * built with either compiler without the host, spdlog, asio or fmt. It pins the frozen v3 profile
+ * @c u42::abi::v3 only: v1 and v2 are different, non-source-compatible interfaces.
  *
  * @code
- *   g++     -std=c++17 -Wall -Wextra -Werror -Iinc tests/abi_test.cc -o /tmp/u42-abi-test
- *   clang++ -std=c++17 -Wall -Wextra -Werror -Iinc tests/abi_test.cc -o /tmp/u42-abi-test
+ *   g++     -std=c++17 -Wall -Wextra -Werror -Iinc tests/abi_test.cc -o build/invoke-v3/abi/abi_test_gcc
+ *   clang++ -std=c++17 -Wall -Wextra -Werror -Iinc tests/abi_test.cc -o build/invoke-v3/abi/abi_test_clang
  * @endcode
  *
- * What it verifies: the frozen v2 contract is restated here as compile-time assertions (integer
- * widths, status values, opaque identifier defaults, descriptor layout, the credential-only lease
- * shape, the protocol contract helpers, every virtual signature with its calling convention and
- * noexcept, the entry signature and symbol name) and as mock-based runtime checks (entry
- * negotiation, output clearing, multi-interface query adjustment, lifecycle destruction). An
- * accidental edit to abi.hpp therefore fails this build instead of silently changing the binary
- * interface.
+ * What it verifies: the frozen v3 contract is restated here as compile-time assertions (integer
+ * widths, status values, opaque identifier defaults, descriptor layout including the typed
+ * @c plugin_version, the credential-plus-version lease shape, the closed version-range helpers,
+ * every virtual signature with its calling convention and noexcept, the entry signature and symbol
+ * name) and as mock-based runtime checks (entry negotiation, output clearing, multi-interface query
+ * adjustment, lifecycle destruction, credential-first direct calls). An accidental edit to abi.hpp
+ * therefore fails this build instead of silently changing the binary interface.
  *
- * Two v2 obligations are asserted structurally rather than functionally, because no size or
+ * Three v3 obligations are asserted structurally rather than functionally, because no size or
  * alignment trait can observe them: a lease carries no peer address (@c borrow must not declare a
- * @c ptr member, and must be exactly one credential wide) and a binding cannot be created without a
- * lease credential (@c icalls bind takes a @c token first, never a plug id or interface pointer).
+ * @c ptr member) and it carries the actual version next to the credential, a call cannot be
+ * presented without a lease credential (both icalls entry points take a @c token first, never a
+ * plug id, binding or interface pointer), and the v2 binding surface is gone rather than ignored
+ * (@c icalls must not declare @c bind_name / @c bind_id / @c unbind / @c call and @c caps_desc must
+ * not declare @c protocol; a member that nothing reads still moves the layout).
+ *
+ * @note The v2 public @c binding and @c contract types cannot be probed from this file, because
+ *       naming a type that no longer exists would make the file uncompilable forever instead of
+ *       failing only when the type comes back. They are covered by separate negative compile
+ *       probes kept beside the build output, not by this translation unit.
  *
  * What it deliberately does not claim:
  * - It does not prove binary compatibility between a separately compiled plugin and host. Two
@@ -57,7 +66,7 @@
 
 namespace {
 
-namespace a = u42::abi::v2;
+namespace a = u42::abi::v3;
 
 const char* g_current_test = nullptr;
 
@@ -201,14 +210,20 @@ T* stale_sentinel() noexcept
 }
 
 /**
- * @brief Compile-time probes for ABI members that v2 deliberately removed.
+ * @brief Compile-time probes for ABI members that v3 (or an earlier profile) deliberately removed.
  *
  * A field that no code reads still changes the layout, so "unused" is not the same as "absent".
  * No size, alignment or type trait can report a member's name, so these probes are the only way to
- * assert at compile time that the v1 peer address (@c borrow::ptr) and the v1 cross-plugin
- * interface list (@c caps_desc::interfaces / @c interface_count) are gone rather than ignored.
+ * assert at compile time that the v1 peer address (@c borrow::ptr), the v1 cross-plugin interface
+ * list (@c caps_desc::interfaces / @c interface_count), the v2 inline protocol (@c caps_desc::
+ * protocol) and the v2 binding surface (@c icalls::bind_name / @c bind_id / @c call / @c unbind) are
+ * gone rather than ignored.
  *
  * @tparam T Type whose member list is inspected.
+ * @note Each probe resolves @c &T::member through @c void_t, so an absent member is a substitution
+ *       failure rather than a hard error and the probe compiles whether or not the member exists.
+ *       A probe only sees member names, so this file cannot observe virtual slot order or a third
+ *       entry point that happens to be spelled call_name(); that stays a review obligation.
  */
 template <class T, class = void>
 struct has_member_ptr : std::false_type {};
@@ -224,6 +239,31 @@ template <class T, class = void>
 struct has_member_interface_count : std::false_type {};
 template <class T>
 struct has_member_interface_count<T, std::void_t<decltype(&T::interface_count)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_protocol : std::false_type {};
+template <class T>
+struct has_member_protocol<T, std::void_t<decltype(&T::protocol)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_bind_name : std::false_type {};
+template <class T>
+struct has_member_bind_name<T, std::void_t<decltype(&T::bind_name)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_bind_id : std::false_type {};
+template <class T>
+struct has_member_bind_id<T, std::void_t<decltype(&T::bind_id)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_unbind : std::false_type {};
+template <class T>
+struct has_member_unbind<T, std::void_t<decltype(&T::unbind)>> : std::true_type {};
+
+template <class T, class = void>
+struct has_member_call : std::false_type {};
+template <class T>
+struct has_member_call<T, std::void_t<decltype(&T::call)>> : std::true_type {};
 
 /**
  * @brief State shared by the mock factory and every mock instance it creates.
@@ -357,7 +397,9 @@ struct mock_fty final : a::iplug_fty {
         ++state_.describe_calls;
         if (state_.fail_describe) return a::failed;
         desc_.plug_id = "u42.test.mock";
-        desc_.version = "1.0.0";
+        // v3 metadata carries the typed business version; there is no version string to parse and
+        // no old string field to keep as an alias.
+        desc_.version = a::plugin_version{1, 0, 0};
         desc_.priority = 10;
         *out = &desc_;
         return a::ok;
@@ -402,8 +444,9 @@ a::iplug_fty* mock_factory()
  * @param major Requested ABI major.
  * @param out Caller-owned output slot; a required argument, so null is a parameter error.
  * @return invalid_argument for a null @p out or @p major zero, unsupported for a different major
- *         (including the incompatible v1 profile), ok when @p major matches abi::v2::abi_major. A
- *         rejected negotiation leaves the caller's output cleared rather than stale.
+ *         (including the incompatible v2 and v1 profiles), ok when @p major matches
+ *         abi::v3::abi_major. A rejected negotiation leaves the caller's output cleared rather
+ *         than stale.
  */
 extern "C" a::status U42_CALL u42_abi_test_mock_entry(std::uint32_t major,
                                                      a::iplug_fty** out) noexcept
@@ -505,19 +548,23 @@ struct mock_context final : a::ictx, a::ievents, a::icaps {
         return a::unsupported;
     }
 
-    a::status U42_CALL acquire(const char* plug_id, const a::contract* required, a::irevoker* receiver,
-                               a::borrow* out) noexcept override
+    a::status U42_CALL acquire(const char* plug_id, const a::version_range* allowed,
+                               a::irevoker* receiver, a::borrow* out) noexcept override
     {
         if (out == nullptr) return a::invalid_argument;
         // A legal lease output is cleared before anything else happens, so a rejected lease never
-        // leaves a stale credential (let alone an address) for the caller to use.
+        // leaves a stale credential or a stale version for the caller to use.
         *out = a::borrow{};
         ++state.caps_calls;
-        if (plug_id == nullptr || required == nullptr || receiver == nullptr) {
+        if (plug_id == nullptr || allowed == nullptr || receiver == nullptr) {
             return a::invalid_argument;
         }
+        // Reversed endpoints are a parameter error before any provider is considered, which is the
+        // documented acquire() rule and the reason a rejected range still clears the output.
+        if (!a::valid_version_range(*allowed)) return a::invalid_argument;
         // A bare context owns no provider, so it can never grant a lease; what this stand-in does
-        // verify is that only a credential can appear in the lease slot, never a peer address.
+        // verify is that only a credential plus a version can appear in the lease slot, never a
+        // peer address.
         return a::unsupported;
     }
 
@@ -528,6 +575,43 @@ struct mock_context final : a::ictx, a::ievents, a::icaps {
     }
 
     context_state state;
+};
+
+/**
+ * @brief Mock lease-only call gateway recording which entry point received which credential.
+ *
+ * v3 exposes exactly two call entry points and both take a lease credential rather than a binding,
+ * which a mock is the only way to observe at runtime: the credential's type cannot be recovered
+ * from a status code. The mock forwards to the caller's writer exactly as the host does, so the
+ * bytes rule and the output-clearing rules stay exercised on this path too.
+ */
+struct mock_calls final : a::icalls {
+    a::status U42_CALL call_name(a::token credential, const char* name, a::bytes args,
+                                 a::iwriter* result) noexcept override
+    {
+        if (name == nullptr || result == nullptr) return a::invalid_argument;
+        if (!bytes_rule_holds(args)) return a::invalid_argument;
+        credential_ = credential;
+        name_ = name;
+        ++name_calls;
+        return result->write(args);
+    }
+
+    a::status U42_CALL call_id(a::token credential, a::method_id method, a::bytes args,
+                               a::iwriter* result) noexcept override
+    {
+        if (result == nullptr || !bytes_rule_holds(args)) return a::invalid_argument;
+        credential_ = credential;
+        id_ = method;
+        ++id_calls;
+        return result->write(args);
+    }
+
+    a::token credential_{};
+    const char* name_ = nullptr;
+    a::method_id id_ = 0;
+    int name_calls = 0;
+    int id_calls = 0;
 };
 
 /**
@@ -556,8 +640,9 @@ struct bytes_writer final : a::iwriter {
  */
 namespace natural {
 constexpr std::size_t plug_id = align_up(2 * sizeof(std::uint32_t), alignof(const char*));
-constexpr std::size_t version = plug_id + sizeof(const char*);
-constexpr std::size_t priority = version + sizeof(const char*);
+constexpr std::size_t version =
+    align_up(plug_id + sizeof(const char*), alignof(a::plugin_version));
+constexpr std::size_t priority = version + sizeof(a::plugin_version);
 constexpr std::size_t before_count = priority + sizeof(std::int32_t);
 constexpr std::size_t before =
     align_up(before_count + sizeof(std::uint32_t), alignof(const char* const*));
@@ -574,37 +659,46 @@ constexpr std::size_t method_output_schema = method_input_schema + sizeof(const 
 constexpr std::size_t method_desc_size =
     align_up(method_output_schema + sizeof(const char*), alignof(a::method_desc));
 
-// v2: a protocol contract is an identity plus two version numbers, and its natural-alignment
-// layout follows field by field, independent of the pointer width.
-constexpr std::size_t contract_major = align_up(sizeof(a::iid), alignof(std::uint32_t));
-constexpr std::size_t contract_minor = contract_major + sizeof(std::uint32_t);
-constexpr std::size_t contract_size =
-    align_up(contract_minor + sizeof(std::uint32_t), alignof(a::contract));
-
-// v2 caps_desc no longer publishes a cross-plugin interface list: struct_size, method_count,
-// methods, protocol. The contract therefore follows the methods pointer with no extra tag.
+// v3 caps_desc publishes only a method table: struct_size, method_count, methods. The v2 inline
+// protocol is gone, so the methods pointer is the last field.
 constexpr std::size_t caps_methods =
     align_up(2 * sizeof(std::uint32_t), alignof(const a::method_desc*));
-constexpr std::size_t caps_protocol =
-    align_up(caps_methods + sizeof(const a::method_desc*), alignof(a::contract));
 constexpr std::size_t caps_desc_size =
-    align_up(caps_protocol + sizeof(a::contract), alignof(a::caps_desc));
+    align_up(caps_methods + sizeof(const a::method_desc*), alignof(a::caps_desc));
+
+// v3 plugin_version is three 32-bit integers; version_range is a closed pair of them.
+constexpr std::size_t version_minor = align_up(sizeof(std::uint32_t), alignof(std::uint32_t));
+constexpr std::size_t version_patch = version_minor + sizeof(std::uint32_t);
+constexpr std::size_t plugin_version_size =
+    align_up(version_patch + sizeof(std::uint32_t), alignof(a::plugin_version));
+
+constexpr std::size_t range_minimum = 0;
+constexpr std::size_t range_maximum =
+    align_up(range_minimum + sizeof(a::plugin_version), alignof(a::plugin_version));
+constexpr std::size_t range_size =
+    align_up(range_maximum + sizeof(a::plugin_version), alignof(a::version_range));
 
 constexpr std::size_t bytes_size_field = align_up(sizeof(const void*), alignof(std::uint64_t));
 constexpr std::size_t bytes_size =
     align_up(bytes_size_field + sizeof(std::uint64_t), alignof(a::bytes));
 
-// v2: the lease holds exactly one opaque credential, so its own model starts at offset zero.
+// v3 lease: one opaque credential followed by the actual version the host selected. There is no
+// slot a peer address could occupy.
 constexpr std::size_t borrow_credential = 0;
+constexpr std::size_t borrow_version =
+    align_up(borrow_credential + sizeof(a::token), alignof(a::plugin_version));
 constexpr std::size_t borrow_size =
-    align_up(borrow_credential + sizeof(a::token), alignof(a::borrow));
+    align_up(borrow_version + sizeof(a::plugin_version), alignof(a::borrow));
 
 constexpr std::size_t event_payload = align_up(sizeof(const char*), alignof(a::bytes));
 constexpr std::size_t event_size = align_up(event_payload + sizeof(a::bytes), alignof(a::event));
 
+// v3 cap_event carries the reporting instance's typed version between available and capabilities.
 constexpr std::size_t cap_event_available = sizeof(const char*);
+constexpr std::size_t cap_event_version =
+    align_up(cap_event_available + sizeof(std::uint32_t), alignof(a::plugin_version));
 constexpr std::size_t cap_event_capabilities =
-    align_up(cap_event_available + sizeof(std::uint32_t), alignof(a::caps_desc));
+    align_up(cap_event_version + sizeof(a::plugin_version), alignof(a::caps_desc));
 constexpr std::size_t cap_event_size =
     align_up(cap_event_capabilities + sizeof(a::caps_desc), alignof(a::cap_event));
 } // namespace natural
@@ -644,11 +738,12 @@ TEST_CASE(status_and_method_id_are_fixed_width)
     static_assert(sizeof(a::status) == 4 && sizeof(a::method_id) == 4);
     static_assert(std::is_unsigned_v<a::status> && std::is_unsigned_v<a::method_id>);
 
-    // The frozen major version. v2 is a distinct, non-source-compatible profile, so the value is
-    // pinned rather than merely compared, and a stale v1 expectation cannot slip through.
+    // The frozen major version. v3 is a distinct, non-source-compatible profile, so the value is
+    // pinned rather than merely compared, and a stale v2 or v1 expectation cannot slip through.
     static_assert(std::is_same_v<decltype(a::abi_major), const std::uint32_t>);
-    static_assert(a::abi_major == 2u);
+    static_assert(a::abi_major == 3u);
     static_assert(a::abi_major != 1u, "v1 layouts are incompatible with this profile");
+    static_assert(a::abi_major != 2u, "v2 bound methods to a protocol contract; it is not this ABI");
 
     // Every named status keeps the numeric value the frozen wire protocol publishes.
     static_assert(a::ok == 0);
@@ -666,7 +761,7 @@ TEST_CASE(status_and_method_id_are_fixed_width)
     static_assert(a::deferred == 12);
 
     static_assert(a::entry_name != nullptr);
-    CHECK(a::abi_major == 2u);
+    CHECK(a::abi_major == 3u);
 
     constexpr a::status codes[] = {
         a::ok,          a::invalid_argument, a::unsupported, a::not_found, a::duplicate,
@@ -684,9 +779,9 @@ TEST_CASE(abi_structs_are_standard_layout_and_trivially_copyable)
 {
     U42_FROZEN_POD(a::iid);
     U42_FROZEN_POD(a::token);
-    U42_FROZEN_POD(a::binding);
+    U42_FROZEN_POD(a::plugin_version);
+    U42_FROZEN_POD(a::version_range);
     U42_FROZEN_POD(a::bytes);
-    U42_FROZEN_POD(a::contract);
     U42_FROZEN_POD(a::borrow);
     U42_FROZEN_POD(a::plug_desc);
     U42_FROZEN_POD(a::method_desc);
@@ -699,32 +794,41 @@ TEST_CASE(abi_structs_are_standard_layout_and_trivially_copyable)
     static_assert(!std::is_standard_layout_v<a::ictx>);
 
     // Fixed-width members keep their width and natural alignment on any data model.
-    static_assert(sizeof(a::iid) == 16 && sizeof(a::token) == 8 && sizeof(a::binding) == 8);
+    static_assert(sizeof(a::iid) == 16 && sizeof(a::token) == 8);
+    static_assert(sizeof(a::plugin_version) == 12 && sizeof(a::version_range) == 24);
     static_assert(std::is_same_v<decltype(a::iid::high), std::uint64_t>);
     static_assert(std::is_same_v<decltype(a::iid::low), std::uint64_t>);
     static_assert(std::is_same_v<decltype(a::bytes::size), std::uint64_t>);
+    static_assert(std::is_same_v<decltype(a::plugin_version::major), std::uint32_t>);
+    static_assert(std::is_same_v<decltype(a::plugin_version::minor), std::uint32_t>);
+    static_assert(std::is_same_v<decltype(a::plugin_version::patch), std::uint32_t>);
     static_assert(alignof(a::iid) == alignof(std::uint64_t));
     static_assert(alignof(a::token) == alignof(std::uint64_t));
+    static_assert(alignof(a::plugin_version) == alignof(std::uint32_t));
+    static_assert(alignof(a::version_range) == alignof(std::uint32_t));
 }
 
-TEST_CASE(official_iids_encode_the_v2_tag)
+TEST_CASE(official_iids_encode_the_v3_tag)
 {
-    // The high half spells "42U_ABI2" byte by byte and equals the frozen v2 literal, so an
-    // accidentally invented or v1-derived iid is obvious.
-    static_assert(tag_spells(a::events_iid.high, "42U_ABI2"));
-    static_assert(tag_spells(a::caps_iid.high, "42U_ABI2"));
-    static_assert(tag_spells(a::calls_iid.high, "42U_ABI2"));
-    static_assert(tag_spells(a::diag_iid.high, "42U_ABI2"));
-    static_assert(tag_spells(a::invoke_iid.high, "42U_ABI2"));
-    static_assert(a::events_iid.high == 0x3432555f41424932ULL);
-    static_assert(a::caps_iid.high == 0x3432555f41424932ULL);
-    static_assert(a::calls_iid.high == 0x3432555f41424932ULL);
-    static_assert(a::diag_iid.high == 0x3432555f41424932ULL);
-    static_assert(a::invoke_iid.high == 0x3432555f41424932ULL);
-    // The version tag lives in the identity itself: a v1 high half must not compare equal.
+    // The high half spells "42U_ABI3" byte by byte and equals the frozen v3 literal, so an
+    // accidentally invented, v1- or v2-derived iid is obvious.
+    static_assert(tag_spells(a::events_iid.high, "42U_ABI3"));
+    static_assert(tag_spells(a::caps_iid.high, "42U_ABI3"));
+    static_assert(tag_spells(a::calls_iid.high, "42U_ABI3"));
+    static_assert(tag_spells(a::diag_iid.high, "42U_ABI3"));
+    static_assert(tag_spells(a::invoke_iid.high, "42U_ABI3"));
+    static_assert(a::events_iid.high == 0x3432555f41424933ULL);
+    static_assert(a::caps_iid.high == 0x3432555f41424933ULL);
+    static_assert(a::calls_iid.high == 0x3432555f41424933ULL);
+    static_assert(a::diag_iid.high == 0x3432555f41424933ULL);
+    static_assert(a::invoke_iid.high == 0x3432555f41424933ULL);
+    // The version tag lives in the identity itself: the v2 and v1 high halves must not compare
+    // equal to this profile's ids.
+    static_assert(a::events_iid.high != 0x3432555f41424932ULL);
     static_assert(a::events_iid.high != 0x3432555f41424931ULL);
 
-    // The low half is the published per-contract number, and every official id is distinct.
+    // The low half is the published per-service number, and every official id is distinct. An iid
+    // identifies a framework service only; it is never a plugin business protocol family.
     static_assert(a::events_iid.low == 1);
     static_assert(a::caps_iid.low == 2);
     static_assert(a::calls_iid.low == 3);
@@ -741,18 +845,22 @@ TEST_CASE(official_iids_encode_the_v2_tag)
     static_assert(a::calls_iid != a::invoke_iid);
     static_assert(a::diag_iid != a::invoke_iid);
 
-    // A zero identifier is not a published contract; comparison stays constexpr and noexcept.
+    // A zero identifier is not a published service; comparison stays constexpr and noexcept.
     static_assert(a::events_iid != a::iid{});
-    static_assert(a::events_iid == a::iid{0x3432555f41424932ULL, 1});
-    static_assert(std::is_same_v<decltype(&a::operator==), bool (*)(a::iid, a::iid) noexcept>);
-    static_assert(std::is_same_v<decltype(&a::operator!=), bool (*)(a::iid, a::iid) noexcept>);
+    static_assert(a::events_iid == a::iid{0x3432555f41424933ULL, 1});
+    static_assert(std::is_same_v<decltype(static_cast<bool (*)(a::iid, a::iid) noexcept>(
+                                     &a::operator==)),
+                                 bool (*)(a::iid, a::iid) noexcept>);
+    static_assert(std::is_same_v<decltype(static_cast<bool (*)(a::iid, a::iid) noexcept>(
+                                     &a::operator!=)),
+                                 bool (*)(a::iid, a::iid) noexcept>);
     static_assert(noexcept(a::events_iid == a::caps_iid));
 
     constexpr a::iid ids[] = {a::events_iid, a::caps_iid, a::calls_iid, a::diag_iid, a::invoke_iid};
     constexpr std::size_t count = sizeof(ids) / sizeof(ids[0]);
     CHECK(count == 5);
     for (std::size_t i = 0; i < count; ++i) {
-        CHECK(ids[i].high == 0x3432555f41424932ULL);
+        CHECK(ids[i].high == 0x3432555f41424933ULL);
         CHECK(ids[i].low == static_cast<std::uint64_t>(i + 1));
         for (std::size_t j = i + 1; j < count; ++j) CHECK(ids[i] != ids[j]);
     }
@@ -786,23 +894,29 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(offsetof(a::method_desc, output_schema) == natural::method_output_schema);
     static_assert(sizeof(a::method_desc) == natural::method_desc_size);
 
-    static_assert(offsetof(a::contract, id) == 0);
-    static_assert(offsetof(a::contract, major) == natural::contract_major);
-    static_assert(offsetof(a::contract, minor) == natural::contract_minor);
-    static_assert(sizeof(a::contract) == natural::contract_size);
+    // v3 plugin_version: three 32-bit components in numeric order, then the closed version_range.
+    static_assert(offsetof(a::plugin_version, major) == 0);
+    static_assert(offsetof(a::plugin_version, minor) == natural::version_minor);
+    static_assert(offsetof(a::plugin_version, patch) == natural::version_patch);
+    static_assert(sizeof(a::plugin_version) == natural::plugin_version_size);
+
+    static_assert(offsetof(a::version_range, minimum) == natural::range_minimum);
+    static_assert(offsetof(a::version_range, maximum) == natural::range_maximum);
+    static_assert(sizeof(a::version_range) == natural::range_size);
 
     static_assert(offsetof(a::caps_desc, struct_size) == 0);
     static_assert(offsetof(a::caps_desc, method_count) == sizeof(std::uint32_t));
     static_assert(offsetof(a::caps_desc, methods) == natural::caps_methods);
-    static_assert(offsetof(a::caps_desc, protocol) == natural::caps_protocol);
     static_assert(sizeof(a::caps_desc) == natural::caps_desc_size);
 
     static_assert(offsetof(a::bytes, data) == 0);
     static_assert(offsetof(a::bytes, size) == natural::bytes_size_field);
     static_assert(sizeof(a::bytes) == natural::bytes_size);
 
-    // The lease's only field is the credential; there is no slot a peer address could occupy.
+    // The lease is its credential plus the actual version; there is no slot a peer address could
+    // occupy, and the version cannot be mistaken for the credential because it starts after it.
     static_assert(offsetof(a::borrow, credential) == natural::borrow_credential);
+    static_assert(offsetof(a::borrow, version) == natural::borrow_version);
     static_assert(sizeof(a::borrow) == natural::borrow_size);
 
     static_assert(offsetof(a::event, name) == 0);
@@ -811,6 +925,7 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
 
     static_assert(offsetof(a::cap_event, plug_id) == 0);
     static_assert(offsetof(a::cap_event, available) == natural::cap_event_available);
+    static_assert(offsetof(a::cap_event, version) == natural::cap_event_version);
     static_assert(offsetof(a::cap_event, capabilities) == natural::cap_event_capabilities);
     static_assert(sizeof(a::cap_event) == natural::cap_event_size);
 
@@ -819,22 +934,31 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(a::caps_desc{}.struct_size == sizeof(a::caps_desc));
     static_assert(std::is_same_v<decltype(a::plug_desc::struct_size), std::uint32_t>);
     static_assert(std::is_same_v<decltype(a::caps_desc::method_count), std::uint32_t>);
-    static_assert(std::is_same_v<decltype(a::caps_desc::protocol), a::contract>);
+    static_assert(std::is_same_v<decltype(a::caps_desc::methods), const a::method_desc*>);
+    static_assert(std::is_same_v<decltype(a::plug_desc::version), a::plugin_version>,
+                  "v3 publishes the typed business version, not a version string");
+    static_assert(!std::is_constructible_v<a::plugin_version, const char*>,
+                  "a version string cannot stand in for the typed metadata field");
+    static_assert(!std::is_convertible_v<const char*, a::plugin_version>);
+    static_assert(a::plug_desc{}.version == a::plugin_version{});
+    static_assert(a::cap_event{}.version == a::plugin_version{});
     static_assert(a::plug_desc{}.reserved == 0);
     static_assert(a::plug_desc{}.before == nullptr && a::plug_desc{}.after == nullptr);
     static_assert(a::plug_desc{}.before_count == 0 && a::plug_desc{}.after_count == 0);
     static_assert(a::caps_desc{}.methods == nullptr);
-    static_assert(a::caps_desc{}.protocol.id == a::iid{});
-    static_assert(a::caps_desc{}.protocol.major == 0 && a::caps_desc{}.protocol.minor == 0);
-    static_assert(a::contract{}.id == a::iid{});
-    static_assert(a::contract{}.major == 0 && a::contract{}.minor == 0);
+    static_assert(a::version_range{}.minimum == a::plugin_version{} &&
+                  a::version_range{}.maximum == a::plugin_version{});
+    static_assert(a::borrow{}.version == a::plugin_version{});
 
-    // v2 deleted the v1 cross-plugin interface list entirely: the members must be *absent*, not
-    // merely unused, because an unused field still changes the wire layout.
+    // v2 deleted the v1 cross-plugin interface list and v3 deleted the v2 inline protocol: the
+    // members must be *absent*, not merely unused, because an unused field still changes the wire
+    // layout and a member the host ignores is still an ABI promise.
     static_assert(!has_member_interfaces<a::caps_desc>::value,
                   "caps_desc must not publish a cross-plugin interface list");
     static_assert(!has_member_interface_count<a::caps_desc>::value,
                   "caps_desc must not publish an interface count");
+    static_assert(!has_member_protocol<a::caps_desc>::value,
+                  "caps_desc must not publish the v2 inline protocol");
 
     // Width-independent structural facts, true on every data model.
     static_assert(alignof(a::plug_desc) >= alignof(void*));
@@ -843,10 +967,13 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(sizeof(a::caps_desc) >=
                   offsetof(a::caps_desc, methods) + sizeof(const a::method_desc*));
     static_assert(sizeof(a::caps_desc) ==
-                  offsetof(a::caps_desc, protocol) + sizeof(a::contract));
+                      offsetof(a::caps_desc, methods) + sizeof(const a::method_desc*),
+                  "caps_desc ends exactly at its method table; nothing follows it");
     static_assert(offsetof(a::borrow, credential) == 0);
-    static_assert(sizeof(a::borrow) == sizeof(a::token));
-    static_assert(sizeof(a::contract) > sizeof(a::iid));
+    static_assert(offsetof(a::borrow, version) == sizeof(a::token));
+    static_assert(sizeof(a::borrow) >= sizeof(a::token) + sizeof(a::plugin_version),
+                  "the actual version travels with the credential");
+    static_assert(sizeof(a::version_range) == 2 * sizeof(a::plugin_version));
     CHECK(a::plug_desc{}.struct_size == sizeof(a::plug_desc));
     CHECK(a::caps_desc{}.struct_size == sizeof(a::caps_desc));
 
@@ -858,47 +985,51 @@ TEST_CASE(descriptor_layout_is_pinned_to_natural_alignment)
     static_assert(sizeof(a::iid) == 16 && alignof(a::iid) == 8);
     static_assert(offsetof(a::iid, high) == 0 && offsetof(a::iid, low) == 8);
     static_assert(sizeof(a::token) == 8 && alignof(a::token) == 8);
-    static_assert(sizeof(a::binding) == 8 && alignof(a::binding) == 8);
     static_assert(sizeof(a::bytes) == 16 && alignof(a::bytes) == 8);
-    // v2 lease: 8 bytes, and a peer address is structurally impossible in it.
-    static_assert(sizeof(a::borrow) == 8 && alignof(a::borrow) == 8);
+    // v3 version types: three 32-bit integers, and a closed pair of them.
+    static_assert(sizeof(a::plugin_version) == 12 && alignof(a::plugin_version) == 4);
+    static_assert(offsetof(a::plugin_version, major) == 0);
+    static_assert(offsetof(a::plugin_version, minor) == 4);
+    static_assert(offsetof(a::plugin_version, patch) == 8);
+    static_assert(sizeof(a::version_range) == 24 && alignof(a::version_range) == 4);
+    static_assert(offsetof(a::version_range, minimum) == 0);
+    static_assert(offsetof(a::version_range, maximum) == 12);
+    // v3 lease: credential at 0, the actual version at 8, padded to 24 bytes; a peer address is
+    // structurally impossible in it.
+    static_assert(sizeof(a::borrow) == 24 && alignof(a::borrow) == 8);
     static_assert(offsetof(a::borrow, credential) == 0);
+    static_assert(offsetof(a::borrow, version) == 8);
     static_assert(!has_member_ptr<a::borrow>::value,
-                  "v2 borrow must not carry a peer pointer");
-    // v2 protocol contract: iid, major, minor = 16 + 4 + 4 padded to 24.
-    static_assert(sizeof(a::contract) == 24 && alignof(a::contract) == 8);
-    static_assert(offsetof(a::contract, id) == 0);
-    static_assert(offsetof(a::contract, major) == 16);
-    static_assert(offsetof(a::contract, minor) == 20);
-    static_assert(sizeof(a::plug_desc) == 56 && alignof(a::plug_desc) == 8);
+                  "v3 borrow must not carry a peer pointer");
+    static_assert(sizeof(a::plug_desc) == 64 && alignof(a::plug_desc) == 8);
     static_assert(offsetof(a::plug_desc, plug_id) == 8);
     static_assert(offsetof(a::plug_desc, version) == 16);
-    static_assert(offsetof(a::plug_desc, priority) == 24);
-    static_assert(offsetof(a::plug_desc, before_count) == 28);
-    static_assert(offsetof(a::plug_desc, before) == 32);
-    static_assert(offsetof(a::plug_desc, after_count) == 40);
-    static_assert(offsetof(a::plug_desc, after) == 48);
+    static_assert(offsetof(a::plug_desc, priority) == 28);
+    static_assert(offsetof(a::plug_desc, before_count) == 32);
+    static_assert(offsetof(a::plug_desc, before) == 40);
+    static_assert(offsetof(a::plug_desc, after_count) == 48);
+    static_assert(offsetof(a::plug_desc, after) == 56);
     static_assert(sizeof(a::method_desc) == 40 && alignof(a::method_desc) == 8);
     static_assert(offsetof(a::method_desc, name) == 8);
     static_assert(offsetof(a::method_desc, output_schema) == 32);
-    // v2 caps_desc: struct_size, method_count, methods, protocol(inline contract) = 40; the v1
-    // interface list that used to sit at offset 8 is gone.
-    static_assert(sizeof(a::caps_desc) == 40 && alignof(a::caps_desc) == 8);
+    // v3 caps_desc: struct_size, method_count, methods = 16; the v2 inline protocol and the v1
+    // interface list are gone rather than moved.
+    static_assert(sizeof(a::caps_desc) == 16 && alignof(a::caps_desc) == 8);
     static_assert(offsetof(a::caps_desc, struct_size) == 0);
     static_assert(offsetof(a::caps_desc, method_count) == 4);
     static_assert(offsetof(a::caps_desc, methods) == 8);
-    static_assert(offsetof(a::caps_desc, protocol) == 16);
-    static_assert(offsetof(a::caps_desc, protocol.major) == 32);
     static_assert(sizeof(a::event) == 24 && alignof(a::event) == 8);
     static_assert(offsetof(a::event, payload) == 8);
     static_assert(offsetof(a::event, payload.data) == 8);
     static_assert(offsetof(a::event, payload.size) == 16);
-    // cap_event keeps plug_id/available/capabilities; the nested caps_desc growth moves it to 56.
-    static_assert(sizeof(a::cap_event) == 56 && alignof(a::cap_event) == 8);
+    // cap_event now carries the reporting instance's typed version: plug_id, available, version,
+    // capabilities = 40.
+    static_assert(sizeof(a::cap_event) == 40 && alignof(a::cap_event) == 8);
     static_assert(offsetof(a::cap_event, plug_id) == 0);
     static_assert(offsetof(a::cap_event, available) == 8);
-    static_assert(offsetof(a::cap_event, capabilities) == 16);
-    static_assert(offsetof(a::cap_event, capabilities.protocol) == 16 + 16);
+    static_assert(offsetof(a::cap_event, version) == 12);
+    static_assert(offsetof(a::cap_event, capabilities) == 24);
+    static_assert(std::is_same_v<decltype(a::cap_event::version), a::plugin_version>);
 #else
     // Profiles whose pointers are not 64 bit wide: no literal size is pinned here. Changing the
     // data model changes the offsets and sizes (a 4-byte pointer moves every pointer field and
@@ -946,14 +1077,20 @@ TEST_CASE(interface_signatures_are_frozen)
     U42_FROZEN_SIG(a::icaps, announce, a::status, const a::caps_desc*);
     U42_FROZEN_SIG(a::icaps, watch, a::status, a::icap_sink*, a::token*);
     U42_FROZEN_SIG(a::icaps, unwatch, a::status, a::token);
-    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::contract*, a::irevoker*,
+    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::version_range*, a::irevoker*,
                    a::borrow*);
     U42_FROZEN_SIG(a::icaps, release, a::status, a::token);
 
-    U42_FROZEN_SIG(a::icalls, bind_name, a::status, a::token, const char*, a::binding*);
-    U42_FROZEN_SIG(a::icalls, bind_id, a::status, a::token, a::method_id, a::binding*);
-    U42_FROZEN_SIG(a::icalls, call, a::status, a::binding, a::bytes, a::iwriter*);
-    U42_FROZEN_SIG(a::icalls, unbind, a::status, a::binding);
+    // v3 icalls has exactly two entry points and both take the lease credential first; the
+    // removed v2 binding surface must not resolve at all, and neither may the v1 plug-id forms.
+    U42_FROZEN_SIG(a::icalls, call_name, a::status, a::token, const char*, a::bytes, a::iwriter*);
+    U42_FROZEN_SIG(a::icalls, call_id, a::status, a::token, a::method_id, a::bytes, a::iwriter*);
+    static_assert(!has_member_bind_name<a::icalls>::value,
+                  "v2 bind_name must be absent, not merely unused: a vtable slot is not free");
+    static_assert(!has_member_bind_id<a::icalls>::value, "v2 bind_id must be absent");
+    static_assert(!has_member_unbind<a::icalls>::value, "v2 unbind must be absent");
+    static_assert(!has_member_call<a::icalls>::value,
+                  "the v2 call(binding, args, writer) entry point must not survive as an overload");
 
     U42_FROZEN_SIG(a::idiag, log, void, const char*);
     U42_FROZEN_SIG(a::iinvoke, invoke, a::status, a::method_id, a::bytes, a::iwriter*);
@@ -978,114 +1115,182 @@ TEST_CASE(interface_signatures_are_frozen)
     static_assert(a::entry_name[0] == 'u' && a::entry_name[1] == '4' && a::entry_name[2] == '2');
 
     // The assertions above only matter if a mismatch is actually detectable, which requires
-    // noexcept to be part of the function type: it is, from C++17 onwards. These two negative
-    // checks would silently pass under -std=c++14 and are the reason this file demands C++17.
+    // noexcept to be part of the function type: it is, from C++17 onwards. These negative checks
+    // would silently pass under -std=c++14 and are the reason this file demands C++17.
     static_assert(!std::is_same_v<decltype(&a::ievents::subscribe),
                                   a::status(U42_CALL a::ievents::*)(const char*, a::ievent_sink*,
                                                                     a::token*)>);
     static_assert(!std::is_same_v<decltype(&a::ievents::subscribe),
                                   a::status(U42_CALL a::ievents::*)(const char*, a::ievent_sink*,
                                                                     std::uint64_t*) noexcept>);
+    static_assert(!std::is_same_v<decltype(&a::icalls::call_name),
+                                  a::status(U42_CALL a::icalls::*)(const char*, a::token, a::bytes,
+                                                                   a::iwriter*) noexcept>,
+                  "the lease credential is the first parameter of call_name, not the method name");
+    static_assert(!std::is_same_v<decltype(&a::icalls::call_id),
+                                  a::status(U42_CALL a::icalls::*)(a::method_id, a::token, a::bytes,
+                                                                   a::iwriter*) noexcept>);
+    static_assert(!std::is_same_v<decltype(&a::icaps::acquire),
+                                  a::status(U42_CALL a::icaps::*)(const char*, const a::iid*,
+                                                                  a::irevoker*, a::borrow*) noexcept>);
 }
 
-TEST_CASE(contract_helpers_validate_identity_and_version_boundaries)
+TEST_CASE(version_helpers_validate_closed_ranges_and_numeric_order)
 {
     // Signature and noexcept are part of the frozen contract: these are pure constexpr helpers.
-    static_assert(std::is_same_v<decltype(&a::valid_contract), bool (*)(a::contract) noexcept>);
-    static_assert(std::is_same_v<decltype(&a::compatible_contract),
-                                 bool (*)(a::contract, a::contract) noexcept>);
-    static_assert(noexcept(a::valid_contract(a::contract{})));
-    static_assert(noexcept(a::compatible_contract(a::contract{}, a::contract{})));
+    static_assert(std::is_same_v<decltype(&a::version_less),
+                                 bool (*)(a::plugin_version, a::plugin_version) noexcept>);
+    static_assert(std::is_same_v<decltype(&a::valid_version_range),
+                                 bool (*)(a::version_range) noexcept>);
+    static_assert(std::is_same_v<decltype(&a::accepts_version),
+                                 bool (*)(a::version_range, a::plugin_version) noexcept>);
+    static_assert(std::is_same_v<decltype(&a::exact_version),
+                                 a::version_range (*)(a::plugin_version) noexcept>);
+    using pv_equality = bool (*)(a::plugin_version, a::plugin_version) noexcept;
+    using pv_inequality = bool (*)(a::plugin_version, a::plugin_version) noexcept;
+    static_assert(std::is_same_v<decltype(static_cast<pv_equality>(&a::operator==)), pv_equality>);
+    static_assert(std::is_same_v<decltype(static_cast<pv_inequality>(&a::operator!=)),
+                                 pv_inequality>);
+    static_assert(noexcept(a::version_less(a::plugin_version{}, a::plugin_version{})));
+    static_assert(noexcept(a::valid_version_range(a::version_range{})));
+    static_assert(noexcept(a::accepts_version(a::version_range{}, a::plugin_version{})));
+    static_assert(noexcept(a::exact_version(a::plugin_version{})));
 
-    constexpr a::iid family_a{0x4142495f54455354ULL, 1};
-    constexpr a::iid family_b{0x4142495f54455354ULL, 2};
+    // Numeric, not textual: 1.10.0 sorts after 1.2.0, and 0.0.0 is an ordinary version rather than
+    // a failure marker.
+    static_assert(a::version_less(a::plugin_version{1, 2, 0}, a::plugin_version{1, 10, 0}));
+    static_assert(!a::version_less(a::plugin_version{1, 10, 0}, a::plugin_version{1, 2, 0}));
+    static_assert(a::version_less(a::plugin_version{1, 2, 0}, a::plugin_version{1, 2, 1}));
+    static_assert(a::version_less(a::plugin_version{1, 2, 0}, a::plugin_version{2, 0, 0}));
+    static_assert(!a::version_less(a::plugin_version{1, 2, 0}, a::plugin_version{1, 2, 0}));
+    static_assert(a::plugin_version{0, 0, 0} == a::plugin_version{});
+    static_assert(a::plugin_version{1, 0, 0} != a::plugin_version{1, 0, 1});
+    static_assert(!a::version_less(a::plugin_version{}, a::plugin_version{0, 0, 0}));
+    static_assert(a::accepts_version(a::exact_version(a::plugin_version{0, 0, 0}),
+                                     a::plugin_version{0, 0, 0}));
 
-    // valid_contract: a named family with a positive major. Only "both halves zero" is unnamed, so
-    // a single nonzero half is already a usable identity.
-    static_assert(!a::valid_contract(a::contract{}));
-    static_assert(!a::valid_contract(a::contract{{0, 0}, 1, 0}));
-    static_assert(!a::valid_contract(a::contract{family_a, 0, 0}));
-    static_assert(!a::valid_contract(a::contract{family_a, 0, 7}));
-    static_assert(a::valid_contract(a::contract{family_a, 1, 0}));
-    static_assert(a::valid_contract(a::contract{{0, 1}, 1, 0}));
-    static_assert(a::valid_contract(a::contract{{1, 0}, 1, 0}));
-    static_assert(a::valid_contract(a::contract{family_a, 1, 0xFFFFFFFFu}));
+    // Both endpoints are inclusive, so the lower and upper ends are accepted and one step outside
+    // either end is not. The upper end is exercised at the widest component value.
+    constexpr a::version_range inclusive{{1, 0, 0}, {1, UINT32_MAX, UINT32_MAX}};
+    static_assert(a::valid_version_range(inclusive));
+    static_assert(a::accepts_version(inclusive, a::plugin_version{1, 0, 0}));
+    static_assert(a::accepts_version(inclusive, a::plugin_version{1, UINT32_MAX, UINT32_MAX}));
+    static_assert(a::accepts_version(inclusive, a::plugin_version{1, 5, 0}));
+    static_assert(!a::accepts_version(inclusive, a::plugin_version{0, UINT32_MAX, UINT32_MAX}));
+    static_assert(!a::accepts_version(inclusive, a::plugin_version{2, 0, 0}));
+    static_assert(a::accepts_version(inclusive, a::plugin_version{1, 2, 0}));
 
-    // compatible_contract: identical identity and major, offered minor >= required minor. The minor
-    // boundary is inclusive, and one step below it must fail.
-    static_assert(a::compatible_contract(a::contract{family_a, 1, 0}, a::contract{family_a, 1, 0}));
-    static_assert(a::compatible_contract(a::contract{family_a, 1, 5}, a::contract{family_a, 1, 5}));
-    static_assert(a::compatible_contract(a::contract{family_a, 1, 6}, a::contract{family_a, 1, 5}));
-    static_assert(a::compatible_contract(a::contract{family_a, 1, 0xFFFFFFFFu},
-                                         a::contract{family_a, 1, 0xFFFFFFFEu}));
-    static_assert(!a::compatible_contract(a::contract{family_a, 1, 4}, a::contract{family_a, 1, 5}),
-                  "a provider promising an older minor must be rejected");
-    static_assert(!a::compatible_contract(a::contract{family_a, 2, 9}, a::contract{family_a, 1, 0}),
-                  "a different major is a different wire format, not a newer minor");
-    static_assert(!a::compatible_contract(a::contract{family_a, 1, 9}, a::contract{family_b, 1, 0}),
-                  "the low half is part of the identity, not just the version tag");
-    static_assert(!a::compatible_contract(a::contract{}, a::contract{family_a, 1, 0}));
-    static_assert(!a::compatible_contract(a::contract{family_a, 1, 0}, a::contract{}));
-    static_assert(!a::compatible_contract(a::contract{family_a, 0, 9}, a::contract{family_a, 0, 0}));
+    // min == max is an exact request, and the endpoint is still contained.
+    constexpr a::version_range exact = a::exact_version(a::plugin_version{2, 3, 4});
+    static_assert(exact.minimum == exact.maximum);
+    static_assert(exact.minimum == a::plugin_version{2, 3, 4});
+    static_assert(a::valid_version_range(exact));
+    static_assert(a::accepts_version(exact, a::plugin_version{2, 3, 4}));
+    static_assert(!a::accepts_version(exact, a::plugin_version{2, 3, 5}));
+    static_assert(!a::accepts_version(exact, a::plugin_version{2, 3, 3}));
+
+    // Reversed endpoints are invalid, and an invalid range accepts nothing, not even its own ends.
+    constexpr a::version_range reversed{{2, 0, 0}, {1, 9, 9}};
+    static_assert(!a::valid_version_range(reversed));
+    static_assert(!a::accepts_version(reversed, a::plugin_version{1, 5, 0}));
+    static_assert(!a::accepts_version(reversed, a::plugin_version{2, 0, 0}));
+    static_assert(!a::accepts_version(reversed, a::plugin_version{1, 9, 9}));
+    constexpr a::version_range one_step_reversed{{0, 0, 1}, {0, 0, 0}};
+    static_assert(!a::valid_version_range(one_step_reversed));
+    static_assert(!a::valid_version_range(
+        a::version_range{{0, 1, 0}, {0, 0, UINT32_MAX}}));
+
+    // A range that explicitly crosses a major boundary is honored: the host never narrows or
+    // rejects a range the caller spelled out, and it never infers a policy of its own.
+    constexpr a::version_range across_major{{1, UINT32_MAX, UINT32_MAX}, {2, 0, 0}};
+    static_assert(a::valid_version_range(across_major));
+    static_assert(a::accepts_version(across_major, a::plugin_version{1, UINT32_MAX, UINT32_MAX}));
+    static_assert(a::accepts_version(across_major, a::plugin_version{2, 0, 0}));
+    static_assert(!a::accepts_version(across_major, a::plugin_version{2, 0, 1}));
+
+    // UINT32_MAX is a real component on either end of a range.
+    constexpr a::version_range everything{{0, 0, 0}, {UINT32_MAX, UINT32_MAX, UINT32_MAX}};
+    static_assert(a::valid_version_range(everything));
+    static_assert(a::accepts_version(everything, a::plugin_version{0, 0, 0}));
+    static_assert(a::accepts_version(everything, a::plugin_version{UINT32_MAX, 0, 0}));
+    static_assert(a::accepts_version(everything,
+                                     a::plugin_version{UINT32_MAX, UINT32_MAX, UINT32_MAX}));
+    static_assert(a::accepts_version(a::exact_version(a::plugin_version{0, 0, 0}),
+                                     a::plugin_version{0, 0, 0}),
+                  "0.0.0 cannot be reserved as an empty-range marker");
 
     // constexpr means the verdict exists at compile time; the CHECKs re-run it on real values.
-    constexpr a::contract offered{family_a, 1, 3};
-    constexpr a::contract equal{family_a, 1, 3};
-    constexpr a::contract older{family_a, 1, 2};
-    constexpr a::contract newer{family_a, 1, 4};
-    static_assert(a::compatible_contract(offered, equal));
-    static_assert(a::compatible_contract(offered, older));
-    static_assert(!a::compatible_contract(offered, newer));
-    CHECK(a::compatible_contract(offered, equal));
-    CHECK(a::compatible_contract(offered, older));
-    CHECK(!a::compatible_contract(offered, newer));
-    CHECK(a::compatible_contract(a::contract{family_a, 1, 0}, a::contract{family_a, 1, 0}));
-    CHECK(a::valid_contract(a::contract{family_a, 1, 0}));
-    CHECK(!a::valid_contract(a::contract{}));
+    const a::version_range runtime_range{{1, 2, 0}, {1, 10, 0}};
+    CHECK(a::accepts_version(runtime_range, a::plugin_version{1, 2, 0}));
+    CHECK(a::accepts_version(runtime_range, a::plugin_version{1, 10, 0}));
+    CHECK(!a::accepts_version(runtime_range, a::plugin_version{1, 11, 0}));
+    CHECK(!a::accepts_version(runtime_range, a::plugin_version{1, 1, 9}));
+    CHECK(a::version_less(a::plugin_version{1, 2, 0}, a::plugin_version{1, 10, 0}));
+    CHECK(a::accepts_version(a::exact_version(a::plugin_version{0, 0, 0}), a::plugin_version{}));
+    const a::version_range runtime_reversed{{3, 0, 0}, {2, 0, 0}};
+    CHECK(!a::valid_version_range(runtime_reversed));
+    CHECK(!a::accepts_version(runtime_reversed, a::plugin_version{3, 0, 0}));
+    CHECK(!a::accepts_version(a::exact_version(a::plugin_version{1, 0, 0}),
+                              a::plugin_version{2, 0, 0}));
 }
 
 TEST_CASE(credential_first_calls_cannot_expose_a_peer_pointer)
 {
-    // A lease is a credential, never an address: one token wide, with no member able to hold a
-    // pointer, and not convertible into a pointer-typed value.
+    // A lease is a credential plus the version the host actually selected, never an address: no
+    // member can hold a pointer, and the whole value is not convertible into a pointer-typed one.
     static_assert(!has_member_ptr<a::borrow>::value);
-    static_assert(sizeof(a::borrow) == sizeof(a::token));
+    static_assert(sizeof(a::borrow) >= sizeof(a::token) + sizeof(a::plugin_version));
     static_assert(sizeof(a::token) == sizeof(std::uint64_t));
     static_assert(std::is_same_v<decltype(a::borrow::credential), a::token>);
+    static_assert(std::is_same_v<decltype(a::borrow::version), a::plugin_version>);
     static_assert(!std::is_pointer_v<a::borrow>);
     static_assert(!std::is_convertible_v<a::borrow, void*>);
     static_assert(!std::is_convertible_v<a::borrow, const void*>);
+    static_assert(!std::is_constructible_v<a::borrow, void*>);
+    static_assert(!std::is_constructible_v<a::borrow, const char*>);
     static_assert(!std::is_same_v<a::borrow, a::token>,
                   "the lease must stay a distinct type from a bare credential");
 
-    // The credential is the first parameter of every bind, and the required protocol is the second
-    // parameter of acquire; the v1 plug_id/iid forms must not even resolve.
-    U42_FROZEN_SIG(a::icalls, bind_name, a::status, a::token, const char*, a::binding*);
-    U42_FROZEN_SIG(a::icalls, bind_id, a::status, a::token, a::method_id, a::binding*);
-    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::contract*, a::irevoker*,
+    // The lease credential is the first parameter of both call entry points, and the explicit
+    // version range is the second parameter of acquire; the removed v2 binding surface and the v1
+    // plug-id forms must not even resolve.
+    U42_FROZEN_SIG(a::icalls, call_name, a::status, a::token, const char*, a::bytes, a::iwriter*);
+    U42_FROZEN_SIG(a::icalls, call_id, a::status, a::token, a::method_id, a::bytes, a::iwriter*);
+    U42_FROZEN_SIG(a::icaps, acquire, a::status, const char*, const a::version_range*, a::irevoker*,
                    a::borrow*);
 
-    using bind_name_member = decltype(&a::icalls::bind_name);
-    using bind_id_member = decltype(&a::icalls::bind_id);
+    using call_name_member = decltype(&a::icalls::call_name);
+    using call_id_member = decltype(&a::icalls::call_id);
     using acquire_member = decltype(&a::icaps::acquire);
 
-    static_assert(!std::is_invocable_v<bind_name_member, a::icalls*, const char*, const char*,
-                                       a::binding*>,
-                  "v1 bind_name(plug_id, name, out) must no longer exist");
-    static_assert(!std::is_invocable_v<bind_id_member, a::icalls*, const char*, a::method_id,
-                                       a::binding*>,
-                  "v1 bind_id(plug_id, id, out) must no longer exist");
+    static_assert(!has_member_bind_name<a::icalls>::value,
+                  "v2 bind_name must be absent, not merely unused");
+    static_assert(!has_member_bind_id<a::icalls>::value, "v2 bind_id must be absent");
+    static_assert(!has_member_unbind<a::icalls>::value, "v2 unbind must be absent");
+    static_assert(!has_member_call<a::icalls>::value,
+                  "v2 call(binding, args, writer) must not survive, even as an overload");
+    static_assert(!std::is_invocable_v<call_name_member, a::icalls*, const char*, const char*,
+                                       a::bytes, a::iwriter*>,
+                  "v2 call_name(plug_id, name, args, writer) must no longer exist");
+    static_assert(!std::is_invocable_v<call_id_member, a::icalls*, const char*, a::method_id,
+                                       a::bytes, a::iwriter*>,
+                  "v2 call_id(plug_id, id, args, writer) must no longer exist");
     static_assert(!std::is_invocable_v<acquire_member, a::icaps*, const char*, const a::iid*,
                                        a::irevoker*, a::borrow*>,
                   "v1 acquire(plug_id, iid, receiver, out) must no longer exist");
-    static_assert(std::is_invocable_v<bind_name_member, a::icalls*, a::token, const char*,
-                                      a::binding*>);
-    static_assert(std::is_invocable_v<acquire_member, a::icaps*, const char*, const a::contract*,
+    static_assert(std::is_invocable_v<call_name_member, a::icalls*, a::token, const char*,
+                                      a::bytes, a::iwriter*>);
+    static_assert(std::is_invocable_v<call_id_member, a::icalls*, a::token, a::method_id, a::bytes,
+                                      a::iwriter*>);
+    static_assert(std::is_invocable_v<acquire_member, a::icaps*, const char*, const a::version_range*,
                                       a::irevoker*, a::borrow*>);
 
-    // caps_desc publishes a method list and an inline protocol, not a cross-plugin interface list.
+    // caps_desc publishes a method table only: no cross-plugin interface list and no inline
+    // protocol contract, so a credential plus the host's own method resolution is all that selects
+    // what runs.
     static_assert(!has_member_interfaces<a::caps_desc>::value);
     static_assert(!has_member_interface_count<a::caps_desc>::value);
+    static_assert(!has_member_protocol<a::caps_desc>::value);
 
     // A credential cannot be produced from a plug id or an address by implicit conversion, so the
     // mandatory lease really is mandatory.
@@ -1094,46 +1299,72 @@ TEST_CASE(credential_first_calls_cannot_expose_a_peer_pointer)
     static_assert(!std::is_convertible_v<const char*, a::token>);
     static_assert(!std::is_convertible_v<void*, a::token>);
 
-    // Runtime restatement of the same shape: the whole lease is its credential, byte for byte.
-    const a::borrow lease{a::token{0x42u}};
+    // Runtime restatement of the same shape: both entry points receive the credential first, and
+    // only a lease value can present one. The mock keeps no peer state; it only reports what it
+    // saw, which is all this dependency-free file can observe about the host's routing.
+    const a::borrow lease{a::token{0x42u}, a::plugin_version{1, 2, 3}};
     const a::borrow copied = lease;
     CHECK(lease.credential.value == 0x42u);
     CHECK(copied.credential.value == 0x42u);
-    CHECK(sizeof(a::borrow) == sizeof(lease.credential));
+    CHECK((copied.version == a::plugin_version{1, 2, 3}));
+    CHECK(offsetof(a::borrow, version) == sizeof(a::token));
+
+    mock_calls calls;
+    a::icalls* const gateway = &calls;
+    bytes_writer sink;
+    const a::token credential{0xC0FFEEu};
+    CHECK(gateway->call_name(credential, "echo", a::bytes{"{}", 2}, &sink) == a::ok);
+    CHECK(calls.credential_.value == 0xC0FFEEu);
+    CHECK(calls.name_calls == 1 && calls.id_calls == 0);
+    CHECK(cstr_equal(calls.name_, "echo"));
+    CHECK(gateway->call_id(credential, 7, a::bytes{nullptr, 0}, &sink) == a::ok);
+    CHECK(calls.credential_.value == 0xC0FFEEu);
+    CHECK(calls.id_ == 7 && calls.id_calls == 1);
+    CHECK(sink.accepted == 2);
+
+    // A lease credential alone is never enough: the writer is required on both paths, and a name
+    // that is missing or an argument view that breaks the bytes rule is rejected before invoke.
+    CHECK(gateway->call_name(credential, "echo", a::bytes{nullptr, 0}, nullptr) ==
+          a::invalid_argument);
+    CHECK(gateway->call_id(credential, 7, a::bytes{nullptr, 0}, nullptr) == a::invalid_argument);
+    CHECK(gateway->call_name(credential, nullptr, a::bytes{nullptr, 0}, &sink) ==
+          a::invalid_argument);
+    CHECK(gateway->call_id(credential, 7, a::bytes{nullptr, 1}, &sink) == a::invalid_argument);
+    CHECK(calls.name_calls == 1 && calls.id_calls == 1);
 }
 
 TEST_CASE(opaque_values_default_to_the_documented_invalid_zero)
 {
     static_assert(a::token{}.value == 0);
-    static_assert(a::binding{}.value == 0);
     static_assert(std::is_same_v<decltype(a::token::value), std::uint64_t>);
-    static_assert(std::is_same_v<decltype(a::binding::value), std::uint64_t>);
     static_assert(std::is_same_v<decltype(a::borrow::credential), a::token>);
+    static_assert(std::is_same_v<decltype(a::borrow::version), a::plugin_version>);
     static_assert(a::borrow{}.credential.value == 0);
+    static_assert(a::borrow{}.version == a::plugin_version{});
     static_assert(!has_member_ptr<a::borrow>::value,
-                  "the lease carries a credential, never an address");
-    static_assert(a::contract{}.id == a::iid{});
-    static_assert(a::contract{}.major == 0 && a::contract{}.minor == 0);
-    static_assert(std::is_same_v<decltype(a::contract::id), a::iid>);
-    static_assert(std::is_same_v<decltype(a::contract::major), std::uint32_t>);
-    static_assert(std::is_same_v<decltype(a::contract::minor), std::uint32_t>);
+                  "the lease carries a credential and a version, never an address");
+    static_assert(a::plugin_version{}.major == 0 && a::plugin_version{}.minor == 0 &&
+                  a::plugin_version{}.patch == 0);
+    static_assert(a::version_range{}.minimum == a::plugin_version{} &&
+                  a::version_range{}.maximum == a::plugin_version{});
     static_assert(a::bytes{}.data == nullptr && a::bytes{}.size == 0);
 
-    // Zero is the documented invalid credential, and it must not be reachable by accident.
+    // Zero is the documented invalid credential, and it must not be reachable by accident. The
+    // version half cannot stand in for success either: an all-zero lease is still a failure, which
+    // is exactly why acquire() reports a status instead of testing the version for zero.
     const a::token empty_token{};
-    const a::binding empty_binding{};
     const a::borrow empty_borrow{};
-    const a::contract empty_contract{};
     const a::bytes empty_bytes{};
     CHECK(empty_token.value == 0);
-    CHECK(empty_binding.value == 0);
     CHECK(empty_borrow.credential.value == 0);
-    CHECK(!a::valid_contract(empty_contract)); // an all-zero protocol is never requestable
+    CHECK(empty_borrow.version == a::plugin_version{});
     CHECK(empty_bytes.data == nullptr && empty_bytes.size == 0);
 
-    // A populated lease still exposes nothing but its credential.
-    const a::borrow lease{a::token{0x1234u}};
+    // A populated lease exposes its credential and the actual version, nothing else.
+    const a::borrow lease{a::token{0x1234u}, a::plugin_version{2, 0, 1}};
     CHECK(lease.credential.value == 0x1234u);
+    CHECK((lease.version == a::plugin_version{2, 0, 1}));
+    CHECK(lease.version != a::plugin_version{});
 }
 
 TEST_CASE(bytes_rule_has_a_concrete_reference_shape)
@@ -1166,9 +1397,14 @@ TEST_CASE(mock_entry_rejects_major_mismatch_and_clears_output)
     CHECK(u42_abi_test_mock_entry(a::abi_major + 1, &out) == a::unsupported);
     CHECK(out == nullptr); // A rejected negotiation never leaves a stale factory behind.
 
-    // The previous profile is rejected by value, not by accident: a host asking for v1 must not be
-    // handed a v2 factory. Rejecting a *real* v1 shared object is a separate integration test that
-    // this dependency-free file cannot perform.
+    // Both previous profiles are rejected by value, not by accident: a host asking for v2 (leases
+    // bound to a protocol contract) or v1 (no leases at all) must not be handed a v3 factory.
+    // Rejecting a *real* v1/v2 shared object is a separate integration test that this
+    // dependency-free file cannot perform.
+    out = stale_sentinel<a::iplug_fty>();
+    CHECK(u42_abi_test_mock_entry(2u, &out) == a::unsupported);
+    CHECK(out == nullptr);
+
     out = stale_sentinel<a::iplug_fty>();
     CHECK(u42_abi_test_mock_entry(1u, &out) == a::unsupported);
     CHECK(out == nullptr);
@@ -1200,7 +1436,9 @@ TEST_CASE(mock_factory_clears_outputs_on_failure)
     CHECK(desc != nullptr);
     CHECK(desc->struct_size == sizeof(a::plug_desc));
     CHECK(cstr_equal(desc->plug_id, "u42.test.mock"));
-    CHECK(cstr_equal(desc->version, "1.0.0"));
+    // The metadata publishes the typed business version, not a string to be parsed or retained.
+    CHECK((desc->version == a::plugin_version{1, 0, 0}));
+    CHECK(desc->version != a::plugin_version{});
     CHECK(desc->priority == 10);
     // The documented array rule: a null array pointer is only legal with a zero count.
     CHECK((desc->before_count != 0) == (desc->before != nullptr));
@@ -1331,29 +1569,36 @@ TEST_CASE(mock_context_query_publishes_adjusted_interface_pointers)
     CHECK(host->query(&a::events_iid, nullptr) == a::invalid_argument);
     CHECK(ctx.state.query_calls == 5);
 
-    // v2 lease negotiation is credential-only. The bare stand-in cannot grant a lease, so what it
-    // verifies here is the shape of the output slot: a rejection never leaves a stale credential
-    // (let alone an address) for the caller, and the receiver is never called without a live lease.
+    // v3 lease negotiation is credential-plus-version. The bare stand-in cannot grant a lease, so
+    // what it verifies here is the shape of the output slot: a rejection never leaves a stale
+    // credential or a stale version for the caller, and the receiver is never called without a
+    // live lease.
     mock_revoker revoker;
     a::icaps* const caps = static_cast<a::icaps*>(&ctx);
-    const a::contract required{{0x4142495f54455354ULL, 1}, 1, 0};
-    a::borrow lease{a::token{0xDEADBEEFu}};
-    CHECK(caps->acquire("u42.test.mock", &required, &revoker, &lease) == a::unsupported);
+    const a::version_range allowed{{1, 0, 0}, {1, UINT32_MAX, UINT32_MAX}};
+    a::borrow lease{a::token{0xDEADBEEFu}, a::plugin_version{9, 9, 9}};
+    CHECK(caps->acquire("u42.test.mock", &allowed, &revoker, &lease) == a::unsupported);
     CHECK(lease.credential.value == 0);
+    CHECK(lease.version == a::plugin_version{});
     CHECK(revoker.calls == 0);
 
-    a::borrow no_plug_id{a::token{7}};
-    CHECK(caps->acquire(nullptr, &required, &revoker, &no_plug_id) == a::invalid_argument);
-    CHECK(no_plug_id.credential.value == 0);
-    a::borrow no_protocol{a::token{7}};
-    CHECK(caps->acquire("u42.test.mock", nullptr, &revoker, &no_protocol) == a::invalid_argument);
-    CHECK(no_protocol.credential.value == 0);
-    a::borrow no_receiver{a::token{7}};
-    CHECK(caps->acquire("u42.test.mock", &required, nullptr, &no_receiver) == a::invalid_argument);
-    CHECK(no_receiver.credential.value == 0);
+    a::borrow no_plug_id{a::token{7}, a::plugin_version{1, 0, 0}};
+    CHECK(caps->acquire(nullptr, &allowed, &revoker, &no_plug_id) == a::invalid_argument);
+    CHECK(no_plug_id.credential.value == 0 && no_plug_id.version == a::plugin_version{});
+    a::borrow no_range{a::token{7}, a::plugin_version{1, 0, 0}};
+    CHECK(caps->acquire("u42.test.mock", nullptr, &revoker, &no_range) == a::invalid_argument);
+    CHECK(no_range.credential.value == 0 && no_range.version == a::plugin_version{});
+    a::borrow no_receiver{a::token{7}, a::plugin_version{1, 0, 0}};
+    CHECK(caps->acquire("u42.test.mock", &allowed, nullptr, &no_receiver) == a::invalid_argument);
+    CHECK(no_receiver.credential.value == 0 && no_receiver.version == a::plugin_version{});
+    // A reversed range is rejected before any provider lookup, and still clears the output.
+    const a::version_range reversed{{2, 0, 0}, {1, 0, 0}};
+    a::borrow bad_range{a::token{7}, a::plugin_version{1, 0, 0}};
+    CHECK(caps->acquire("u42.test.mock", &reversed, &revoker, &bad_range) == a::invalid_argument);
+    CHECK(bad_range.credential.value == 0 && bad_range.version == a::plugin_version{});
     // A null lease output is a parameter error, and the required pointer rules make it unreachable.
-    CHECK(caps->acquire("u42.test.mock", &required, &revoker, nullptr) == a::invalid_argument);
-    CHECK(ctx.state.caps_calls == 5); // the unwatch above plus four reached acquire calls
+    CHECK(caps->acquire("u42.test.mock", &allowed, &revoker, nullptr) == a::invalid_argument);
+    CHECK(ctx.state.caps_calls == 6); // the unwatch above plus five reached acquire calls
 }
 
 std::vector<test_case>& tests()

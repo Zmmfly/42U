@@ -134,24 +134,24 @@ std::string join(const std::vector<std::string>& values)
  * @param nodes Pending nodes under test.
  * @param initialized Already initialized identities.
  * @param expected Expected ABI status.
- * @param expected_order Expected planned identities when expected is abi::v2::ok.
+ * @param expected_order Expected planned identities when expected is abi::v3::ok.
  * @param needle Optional substring the failure diagnostic must contain.
  */
 void expect_plan(const char* label, const std::vector<order_node>& nodes,
-                 const std::vector<std::string>& initialized, abi::v2::status expected,
+                 const std::vector<std::string>& initialized, abi::v3::status expected,
                  const std::vector<std::string>& expected_order, const char* needle = nullptr)
 {
     // Deliberately dirty: a failure must clear it, a success must replace it.
     std::vector<std::size_t> out(nodes.size() + 2, 999);
     std::string error = "stale diagnostic";
-    const abi::v2::status actual = u42::plan_order(nodes, initialized, out, error);
+    const abi::v3::status actual = u42::plan_order(nodes, initialized, out, error);
     if (actual != expected) {
         std::fprintf(stderr, "%s: status %u != %u, error='%s'\n", label, actual, expected,
                      error.c_str());
         std::fflush(stderr);
         std::exit(EXIT_FAILURE);
     }
-    if (expected == abi::v2::ok) {
+    if (expected == abi::v3::ok) {
         CHECK(error.empty());
         const std::vector<std::string> got = planned_ids(nodes, out);
         if (got != expected_order) {
@@ -174,14 +174,14 @@ void expect_plan(const char* label, const std::vector<order_node>& nodes,
 
 TEST_CASE(empty_input_is_ok)
 {
-    expect_plan("empty", {}, {}, abi::v2::ok, {});
+    expect_plan("empty", {}, {}, abi::v3::ok, {});
 }
 
 TEST_CASE(priority_ascending)
 {
     const std::vector<order_node> nodes = {
         make_node("low", 5), make_node("high", -1), make_node("mid", 0)};
-    expect_plan("priority", nodes, {}, abi::v2::ok, {"high", "mid", "low"});
+    expect_plan("priority", nodes, {}, abi::v3::ok, {"high", "mid", "low"});
 }
 
 TEST_CASE(priority_tie_uses_utf8_byte_order)
@@ -192,12 +192,12 @@ TEST_CASE(priority_tie_uses_utf8_byte_order)
                                               make_node("ab", 3), make_node("z", 3),
                                               make_node("\xC3\xA9", 3)};
     const std::vector<std::string> expected = {"A", "a", "ab", "z", "\xC3\xA9"};
-    expect_plan("tie-insertion-order", ascending, {}, abi::v2::ok, expected);
+    expect_plan("tie-insertion-order", ascending, {}, abi::v3::ok, expected);
 
     const std::vector<order_node> reversed = {make_node("\xC3\xA9", 3), make_node("z", 3),
                                              make_node("ab", 3), make_node("a", 3),
                                              make_node("A", 3)};
-    expect_plan("tie-reversed-input", reversed, {}, abi::v2::ok, expected);
+    expect_plan("tie-reversed-input", reversed, {}, abi::v3::ok, expected);
 }
 
 TEST_CASE(hard_edges_override_priority)
@@ -207,12 +207,12 @@ TEST_CASE(hard_edges_override_priority)
     nodes.push_back(make_node("svc", 100));
     nodes.push_back(make_node("app", 50, {"svc"}));
     // app must precede svc, svc must precede log, whatever the priorities say.
-    expect_plan("hard-edges", nodes, {}, abi::v2::ok, {"app", "svc", "log"});
+    expect_plan("hard-edges", nodes, {}, abi::v3::ok, {"app", "svc", "log"});
 
     std::vector<order_node> mirrored;
     mirrored.push_back(make_node("a", 10, {"b"}));
     mirrored.push_back(make_node("b", 0, {}, {"a"}));
-    expect_plan("hard-edge-declared-twice", mirrored, {}, abi::v2::ok, {"a", "b"});
+    expect_plan("hard-edge-declared-twice", mirrored, {}, abi::v3::ok, {"a", "b"});
 }
 
 TEST_CASE(duplicate_edges_are_deduplicated)
@@ -223,28 +223,28 @@ TEST_CASE(duplicate_edges_are_deduplicated)
     // Both endpoints declare the same hard edge, several times over. The plan must stay a
     // single a-before-b constraint: a dedup bug that records an edge once but counts it
     // more often (or the reverse) would strand b and report a bogus cycle here.
-    expect_plan("duplicate-edges", nodes, {}, abi::v2::ok, {"a", "b"});
+    expect_plan("duplicate-edges", nodes, {}, abi::v3::ok, {"a", "b"});
 }
 
 TEST_CASE(self_edges_are_cycles)
 {
-    expect_plan("self-before", {make_node("solo", 0, {"solo"})}, {}, abi::v2::cycle, {}, "'solo'");
-    expect_plan("self-after", {make_node("solo", 0, {}, {"solo"})}, {}, abi::v2::cycle, {},
+    expect_plan("self-before", {make_node("solo", 0, {"solo"})}, {}, abi::v3::cycle, {}, "'solo'");
+    expect_plan("self-after", {make_node("solo", 0, {}, {"solo"})}, {}, abi::v3::cycle, {},
                 "'solo'");
     const std::vector<order_node> both = {make_node("solo", 0, {"solo"}, {"solo"}),
                                          make_node("other", 1)};
-    expect_plan("self-both", both, {}, abi::v2::cycle, {}, "itself");
+    expect_plan("self-both", both, {}, abi::v3::cycle, {}, "itself");
 }
 
 TEST_CASE(mutual_edges_are_cycles)
 {
     const std::vector<order_node> before_cycle = {make_node("a", 0, {"b"}),
                                                  make_node("b", 1, {"a"})};
-    expect_plan("mutual-before", before_cycle, {}, abi::v2::cycle, {}, "cycle");
+    expect_plan("mutual-before", before_cycle, {}, abi::v3::cycle, {}, "cycle");
 
     const std::vector<order_node> after_cycle = {make_node("a", 0, {}, {"b"}),
                                                 make_node("b", 1, {}, {"a"})};
-    expect_plan("mutual-after", after_cycle, {}, abi::v2::cycle, {}, "cycle");
+    expect_plan("mutual-after", after_cycle, {}, abi::v3::cycle, {}, "cycle");
 }
 
 TEST_CASE(graph_cycle_clears_output)
@@ -254,22 +254,22 @@ TEST_CASE(graph_cycle_clears_output)
     nodes.push_back(make_node("y", 0, {"z"}));
     nodes.push_back(make_node("z", 0, {"x"}));
     nodes.push_back(make_node("solo", -100)); // plannable alone, still reported as a failure
-    expect_plan("graph-cycle", nodes, {}, abi::v2::cycle, {}, "cycle");
+    expect_plan("graph-cycle", nodes, {}, abi::v3::cycle, {}, "cycle");
 
     const std::vector<order_node> trailing = {make_node("a", 0), make_node("b", 0, {"c"}),
                                              make_node("c", 0, {"b"})};
-    expect_plan("graph-cycle-tail", trailing, {}, abi::v2::cycle, {}, "cycle");
+    expect_plan("graph-cycle-tail", trailing, {}, abi::v3::cycle, {}, "cycle");
 }
 
 TEST_CASE(unknown_targets_are_not_found)
 {
-    expect_plan("unknown-before", {make_node("a", 0, {"ghost"})}, {}, abi::v2::not_found, {},
+    expect_plan("unknown-before", {make_node("a", 0, {"ghost"})}, {}, abi::v3::not_found, {},
                 "'ghost'");
-    expect_plan("unknown-after", {make_node("a", 0, {}, {"ghost"})}, {}, abi::v2::not_found, {},
+    expect_plan("unknown-after", {make_node("a", 0, {}, {"ghost"})}, {}, abi::v3::not_found, {},
                 "'ghost'");
     const std::vector<order_node> mixed = {make_node("a", 0), make_node("b", 0, {}, {"ghost"})};
-    expect_plan("unknown-after-mixed", mixed, {}, abi::v2::not_found, {}, "'ghost'");
-    expect_plan("empty-target", {make_node("a", 0, {""})}, {}, abi::v2::not_found, {}, "'a'");
+    expect_plan("unknown-after-mixed", mixed, {}, abi::v3::not_found, {}, "'ghost'");
+    expect_plan("empty-target", {make_node("a", 0, {""})}, {}, abi::v3::not_found, {}, "'a'");
 }
 
 TEST_CASE(initialized_constraints_are_enforced)
@@ -277,45 +277,45 @@ TEST_CASE(initialized_constraints_are_enforced)
     // before an initialized plugin is impossible during hot load.
     const std::vector<order_node> impossible = {make_node("ready", 0, {}, {"init"}),
                                                 make_node("late", 0, {"init"})};
-    expect_plan("before-initialized", impossible, {"init"}, abi::v2::invalid_state, {}, "'init'");
+    expect_plan("before-initialized", impossible, {"init"}, abi::v3::invalid_state, {}, "'init'");
 
     // after an initialized plugin is already satisfied and adds no edge.
     const std::vector<order_node> satisfied = {make_node("b", 1, {}, {"init"}),
                                                make_node("a", 5)};
-    expect_plan("after-initialized", satisfied, {"init"}, abi::v2::ok, {"b", "a"});
+    expect_plan("after-initialized", satisfied, {"init"}, abi::v3::ok, {"b", "a"});
 
     const std::vector<order_node> only_after = {make_node("a", 0, {}, {"init"})};
-    expect_plan("after-initialized-only", only_after, {"init"}, abi::v2::ok, {"a"});
+    expect_plan("after-initialized-only", only_after, {"init"}, abi::v3::ok, {"a"});
 }
 
 TEST_CASE(duplicate_identities_are_rejected)
 {
     const std::vector<order_node> pending_duplicate = {make_node("dup", 0), make_node("dup", 1)};
-    expect_plan("duplicate-pending", pending_duplicate, {}, abi::v2::duplicate, {}, "'dup'");
+    expect_plan("duplicate-pending", pending_duplicate, {}, abi::v3::duplicate, {}, "'dup'");
 
     const std::vector<order_node> triple = {make_node("dup", 0), make_node("dup", 1),
                                             make_node("dup", 2)};
-    expect_plan("duplicate-pending-triple", triple, {}, abi::v2::duplicate, {}, "'dup'");
+    expect_plan("duplicate-pending-triple", triple, {}, abi::v3::duplicate, {}, "'dup'");
 
     const std::vector<order_node> single = {make_node("x", 0)};
-    expect_plan("duplicate-initialized", single, {"init", "init"}, abi::v2::duplicate, {},
+    expect_plan("duplicate-initialized", single, {"init", "init"}, abi::v3::duplicate, {},
                 "'init'");
-    expect_plan("pending-and-initialized", single, {"x"}, abi::v2::duplicate, {}, "'x'");
+    expect_plan("pending-and-initialized", single, {"x"}, abi::v3::duplicate, {}, "'x'");
 }
 
 TEST_CASE(empty_identities_are_rejected)
 {
     const std::vector<order_node> blank = {make_node("a", 0), make_node("", 1)};
-    expect_plan("empty-pending-id", blank, {}, abi::v2::invalid_argument, {}, "empty");
+    expect_plan("empty-pending-id", blank, {}, abi::v3::invalid_argument, {}, "empty");
 
     const std::vector<order_node> valid = {make_node("a", 0)};
-    expect_plan("empty-initialized-id", valid, {""}, abi::v2::invalid_argument, {}, "empty");
-    expect_plan("empty-pending-first", {make_node("", 0)}, {}, abi::v2::invalid_argument, {},
+    expect_plan("empty-initialized-id", valid, {""}, abi::v3::invalid_argument, {}, "empty");
+    expect_plan("empty-pending-first", {make_node("", 0)}, {}, abi::v3::invalid_argument, {},
                 "empty");
     // Two blank identities are invalid_argument, not duplicate: emptiness is rejected first.
     const std::vector<order_node> two_blank = {make_node("", 0), make_node("", 0)};
-    expect_plan("empty-pending-twice", two_blank, {}, abi::v2::invalid_argument, {}, "empty");
-    expect_plan("empty-initialized-twice", valid, {"", ""}, abi::v2::invalid_argument, {},
+    expect_plan("empty-pending-twice", two_blank, {}, abi::v3::invalid_argument, {}, "empty");
+    expect_plan("empty-initialized-twice", valid, {"", ""}, abi::v3::invalid_argument, {},
                 "empty");
 }
 
@@ -327,7 +327,7 @@ TEST_CASE(ready_set_is_reselected_after_every_step)
     nodes.push_back(make_node("c", 0, {"d"}));
     nodes.push_back(make_node("d", 2));
     // The minimum is recomputed from the whole ready set after each pick.
-    expect_plan("reselection", nodes, {}, abi::v2::ok, {"c", "d", "b", "a"});
+    expect_plan("reselection", nodes, {}, abi::v3::ok, {"c", "d", "b", "a"});
 }
 
 TEST_CASE(output_and_error_are_hygienic)
@@ -336,12 +336,12 @@ TEST_CASE(output_and_error_are_hygienic)
     const std::vector<order_node> one = {make_node("solo", 0)};
     std::vector<std::size_t> out;
     std::string error = "stale";
-    CHECK(u42::plan_order(two, {}, out, error) == abi::v2::ok);
+    CHECK(u42::plan_order(two, {}, out, error) == abi::v3::ok);
     CHECK(out.size() == 2);
     CHECK(error.empty());
 
     error = "stale again";
-    CHECK(u42::plan_order(one, {}, out, error) == abi::v2::ok);
+    CHECK(u42::plan_order(one, {}, out, error) == abi::v3::ok);
     CHECK(out.size() == 1);
     CHECK(out[0] == 0);
     CHECK(error.empty());
@@ -349,13 +349,13 @@ TEST_CASE(output_and_error_are_hygienic)
     out = {7, 7, 7};
     error = "keep";
     const std::vector<order_node> broken = {make_node("a", 0, {}, {"ghost"})};
-    CHECK(u42::plan_order(broken, {}, out, error) == abi::v2::not_found);
+    CHECK(u42::plan_order(broken, {}, out, error) == abi::v3::not_found);
     CHECK(out.empty());
     CHECK(!error.empty());
 
     // A failure must not poison the next call.
     error = "keep";
-    CHECK(u42::plan_order(two, {}, out, error) == abi::v2::ok);
+    CHECK(u42::plan_order(two, {}, out, error) == abi::v3::ok);
     CHECK(out.size() == 2);
     CHECK(error.empty());
 }
@@ -372,7 +372,7 @@ TEST_CASE(long_chain_stays_linear)
         expected.push_back(node.plug_id);
         nodes.push_back(std::move(node));
     }
-    expect_plan("long-chain", nodes, {}, abi::v2::ok, expected);
+    expect_plan("long-chain", nodes, {}, abi::v3::ok, expected);
 }
 
 std::jmp_buf* g_jump_target = nullptr;

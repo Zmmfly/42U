@@ -120,7 +120,7 @@ struct drain_guard {
 };
 
 /**
- * @brief Deliver one capability notice, carrying the provider's protocol and methods.
+ * @brief Deliver one capability notice, carrying the provider version and its method table.
  *
  * @param runtime Engine owning the watch and record registries.
  * @param notice Dequeued notice, moved out of the queue by the caller so that the
@@ -169,17 +169,18 @@ void deliver_notice(engine& runtime, cap_notice& notice) noexcept
     }
 
     // Both views borrow the notice and this array; they expire when the callback returns. The
-    // protocol is a plain value copied out of the notice, so only the method strings stay
-    // borrowed from the notice while the callback runs.
+    // version is a plain value copied out of the notice, which captured the version of the
+    // generation that queued it, so only the method strings stay borrowed from the notice while
+    // the callback runs.
     a::caps_desc caps{};
     caps.struct_size = sizeof(a::caps_desc);
     caps.method_count = static_cast<std::uint32_t>(methods.size());
     caps.methods = methods.empty() ? nullptr : methods.data();
-    caps.protocol = notice.capabilities.protocol;
 
     a::cap_event value{};
     value.plug_id = notice.provider.c_str();
     value.available = notice.available ? 1u : 0u;
+    value.version = notice.version;
     value.capabilities = caps;
 
     if (runtime.depth != 0) return;

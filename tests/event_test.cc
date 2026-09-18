@@ -5,7 +5,7 @@
  *
  * The file owns its main() and links only against the host sources, so it can be built as:
  *   g++ -std=c++17 -Wall -Wextra -Werror -Iinc src/events.cc src/context.cc src/order.cc
- *       src/plug.cc src/host.cc tests/event_test.cc -o build/invoke-v2/events/event_test
+ *       src/plug.cc src/host.cc tests/event_test.cc -o build/invoke-v3/events/event_test
  *
  * Every fixture is an in-process plugin factory handed to u42::host::add(), so no shared object,
  * no framework and no private header is involved: the checks only use the public ABI in
@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -40,19 +41,8 @@
 
 namespace {
 
-namespace abi = u42::abi::v2;
+namespace abi = u42::abi::v3;
 namespace sdk = u42::sdk;
-
-/**
- * @brief Business protocol every fixture announces: a valid, method-less v2 family.
- *
- * The fixtures publish no methods, so start() announces this protocol with an empty method set.
- * That is the legal v2 shape for an instance that has a lifetime but no callable capability, and
- * it lets the capability-watch case prove the notice view carries protocol+methods instead of a
- * v1 interface list.
- */
-constexpr abi::iid fixture_protocol_id{0x6576666978667431ULL, 1};
-constexpr abi::contract fixture_protocol{fixture_protocol_id, 1u, 0u};
 
 const char* g_current_test = nullptr;
 using check_hook = void (*)(const char* expr, const char* file, int line);
@@ -134,6 +124,20 @@ void expect_status(const char* label, abi::status actual, abi::status expected)
 }
 
 /**
+ * @brief Look up the latest recorded notice version for one provider identity.
+ *
+ * @param versions Per-provider versions recorded by the hub.
+ * @param plug_id Identity to look up.
+ * @return The recorded version, or 0.0.0 when that identity was never observed.
+ */
+abi::plugin_version recorded_version(const std::map<std::string, abi::plugin_version>& versions,
+                                     const char* plug_id)
+{
+    const auto found = versions.find(plug_id);
+    return found == versions.end() ? abi::plugin_version{} : found->second;
+}
+
+/**
  * @brief Observations shared by every fixture of one case; owned by the test body.
  *
  * The hub outlives the host, the factory and the plugin instances, which is what makes it legal to
@@ -152,7 +156,8 @@ struct hub {
     int cap_events = 0;      //!< Number of delivered on_capability() callbacks.
     int cap_available = 0;   //!< Capability notices that reported an available provider.
     int cap_withdrawn = 0;   //!< Capability notices that reported a withdrawal.
-    abi::contract last_available_protocol{}; //!< Protocol carried by the latest available notice.
+    std::map<std::string, abi::plugin_version> available_versions; //!< Latest available version per provider.
+    std::map<std::string, abi::plugin_version> withdrawn_versions; //!< Latest withdrawal version per provider.
     int cancel_calls = 0;    //!< Callback-driven unsubscriptions of other subscriptions.
     abi::status cancel_status = abi::ok; //!< Status of the last callback-driven unsubscription.
     bool in_lifecycle = false;           //!< True while init()/start()/stop() is on the stack.
@@ -168,7 +173,7 @@ struct hub {
  */
 struct fixture_spec {
     std::string plug_id;                 //!< Identity the host registers.
-    std::string version = "1.0";         //!< Version reported by describe().
+    abi::plugin_version version{1, 0, 0}; //!< Version reported by describe().
     std::int32_t priority = 0;           //!< Ordering priority of the fixture.
     std::vector<std::string> before;     //!< Identities this fixture must precede.
     std::vector<std::string> after;      //!< Identities this fixture must follow.
@@ -251,9 +256,10 @@ public:
     }
 
     /**
-     * @brief Announce the fixture's method-less v2 protocol, as a discoverable plugin does.
+     * @brief Announce the fixture's method-less capability set, as a discoverable plugin does.
      *
      * @return The announce status; a non-ok status is recorded in the hub before it is returned.
+     * @note The announced caps_desc holds only a method table; the version lives in plug_desc.
      */
     abi::status U42_CALL start() noexcept override
     {
@@ -261,10 +267,9 @@ public:
         ++shared_.starts;
         abi::status outcome = abi::invalid_state;
         try {
-            // A valid protocol with no methods: the legal v2 shape for a plugin whose only
-            // published capability is its own lifetime. It never answers query(invoke_iid).
+            // A method-less capability set: the legal v3 shape for a plugin whose only published
+            // capability is its own lifetime and version. It never answers query(invoke_iid).
             abi::caps_desc announcement{};
-            announcement.protocol = fixture_protocol;
             if (caps_ != nullptr) outcome = caps_->announce(&announcement);
         } catch (...) {
             outcome = abi::failed;
@@ -354,7 +359,7 @@ public:
     }
 
     /**
-     * @brief Record one capability notice, including the protocol it carries.
+     * @brief Record one capability notice, including the provider version it carries.
      *
      * @param value Borrowed notice, valid only for this call.
      *
@@ -367,9 +372,12 @@ public:
             ++shared_.cap_events;
             if (value != nullptr && value->available != 0) {
                 ++shared_.cap_available;
-                shared_.last_available_protocol = value->capabilities.protocol;
+                if (value->plug_id != nullptr)
+                    shared_.available_versions[value->plug_id] = value->version;
             } else {
                 ++shared_.cap_withdrawn;
+                if (value != nullptr && value->plug_id != nullptr)
+                    shared_.withdrawn_versions[value->plug_id] = value->version;
             }
         } catch (...) {
             ++shared_.failures;
@@ -405,7 +413,7 @@ public:
      * @brief Remove one of the fixture's own subscriptions by event name.
      *
      * @param name Subscribed event name to remove.
-     * @return abi::v2::ok when removed, abi::v2::not_found when this fixture has no such
+     * @return abi::ok when removed, abi::not_found when this fixture has no such
      *         subscription, otherwise the status from ievents::unsubscribe().
      */
     abi::status unsubscribe_named(const char* name) noexcept
@@ -519,7 +527,7 @@ public:
     fixture_factory(fixture_spec spec, hub* shared) : spec_(std::move(spec)), shared_(shared)
     {
         desc_.plug_id = spec_.plug_id.c_str();
-        desc_.version = spec_.version.c_str();
+        desc_.version = spec_.version;
         desc_.priority = spec_.priority;
         before_ = to_pointers(spec_.before);
         after_ = to_pointers(spec_.after);
@@ -918,7 +926,9 @@ TEST_CASE(capability_watch_queues_the_snapshot_instead_of_calling_inline)
     watcher.after = {"fixture.provider"}; // the provider is already active when init() watches
     watcher.watch_capabilities = true;
     fixture_factory watcher_factory(watcher, &shared);
-    fixture_factory provider_factory(make_spec("fixture.provider"), &shared);
+    fixture_spec provider = make_spec("fixture.provider");
+    provider.version = abi::plugin_version{3, 4, 5};
+    fixture_factory provider_factory(provider, &shared);
     u42::host rack;
 
     expect_status("add watcher", rack.add(&watcher_factory), abi::ok);
@@ -934,16 +944,69 @@ TEST_CASE(capability_watch_queues_the_snapshot_instead_of_calling_inline)
     CHECK(shared.inline_callbacks == 0);
     CHECK(shared.cap_events >= 1);
     CHECK(shared.cap_available >= 1);
-    // The protocol+methods view replaced the v1 interface list: the available notice carried the
-    // exact v2 protocol the provider announced, and no interface pointer travelled with it.
-    CHECK(shared.last_available_protocol.id == fixture_protocol.id);
-    CHECK(shared.last_available_protocol.major == fixture_protocol.major);
-    CHECK(abi::valid_contract(shared.last_available_protocol));
+    // The available notice carries the exact version the provider described: the version is copied
+    // from the record metadata, and no interface or business pointer travels with the notice.
+    CHECK((recorded_version(shared.available_versions, "fixture.provider") == provider.version));
+    CHECK(recorded_version(shared.available_versions, "fixture.provider").major == 3);
+    CHECK(recorded_version(shared.available_versions, "fixture.provider").minor == 4);
+    CHECK(recorded_version(shared.available_versions, "fixture.provider").patch == 5);
     CHECK(shared.failures == 0);
 
     const int after_start = shared.cap_events;
     expect_status("poll", rack.poll(), abi::ok);
     CHECK(shared.cap_events == after_start); // nothing else was pending
+}
+
+/**
+ * @brief A replacement identity must not rewrite the version of an already observed generation.
+ *
+ * The provider publishes its version through plug_desc, and every capability notice snapshots
+ * that generation's metadata at queue time. After the first generation is unloaded, a newer
+ * instance reuses its plug_id with a different version: the withdrawal observers saw still
+ * reports the retired generation, while the replacement's availability reports its own version.
+ */
+TEST_CASE(capability_notices_report_the_version_of_their_own_generation)
+{
+    hub shared;
+    fixture_spec watcher = make_spec("fixture.version.watcher");
+    watcher.after = {"fixture.versioned"}; // the first generation is active when init() watches
+    watcher.watch_capabilities = true;
+    fixture_factory watcher_factory(watcher, &shared);
+
+    fixture_spec retired = make_spec("fixture.versioned");
+    retired.version = abi::plugin_version{1, 2, 3};
+    fixture_factory retired_factory(retired, &shared);
+
+    fixture_spec replacement = make_spec("fixture.versioned");
+    replacement.version = abi::plugin_version{9, 8, 7};
+    fixture_factory replacement_factory(replacement, &shared);
+
+    u42::host rack;
+    expect_status("add watcher", rack.add(&watcher_factory), abi::ok);
+    expect_status("add first generation", rack.add(&retired_factory), abi::ok);
+    expect_status("start", rack.start(), abi::ok);
+
+    // The snapshot for the first generation carries the version that very instance described.
+    CHECK(shared.cap_withdrawn == 0);
+    CHECK((recorded_version(shared.available_versions, "fixture.versioned") ==
+           abi::plugin_version{1, 2, 3}));
+
+    expect_status("unload first generation", rack.unload("fixture.versioned"), abi::ok);
+    CHECK(shared.cap_withdrawn == 1);
+    CHECK((recorded_version(shared.withdrawn_versions, "fixture.versioned") ==
+           abi::plugin_version{1, 2, 3}));
+
+    // The replacement reuses the identity with another version. Its availability reports the new
+    // metadata, but the withdrawal keeps the retired generation's version rather than borrowing
+    // the version of the same-name record that now occupies the identity.
+    expect_status("add replacement", rack.add(&replacement_factory), abi::ok);
+    expect_status("restart", rack.start(), abi::ok);
+    CHECK((recorded_version(shared.available_versions, "fixture.versioned") ==
+           abi::plugin_version{9, 8, 7}));
+    CHECK(shared.cap_withdrawn == 1);
+    CHECK((recorded_version(shared.withdrawn_versions, "fixture.versioned") ==
+           abi::plugin_version{1, 2, 3}));
+    CHECK(shared.failures == 0);
 }
 
 } // namespace

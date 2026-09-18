@@ -8,8 +8,9 @@
  *   invocation cannot dlopen() a candidate.
  * - Arguments are forwarded to the plugin verbatim as bounded ABI bytes; this tool contains no
  *   JSON parser and never rewrites the JSON document that the plugin returned.
- * - A protocol is discovered explicitly through u42::host::protocol() before a call and passed to
- *   the one-shot call, because a release version never determines the business protocol.
+ * - The provider version is discovered explicitly through u42::host::version() before a call, and
+ *   an exact-version range built from it is passed to the one-shot call, because accepting one
+ *   discovered version for a single management call says nothing about later releases.
  * - At most one action runs per process, and the rack is always shut down explicitly before the
  *   process exits, so capabilities are withdrawn and instances stop instead of being dropped.
  *
@@ -32,7 +33,7 @@
 namespace {
 
 /** @brief Frozen ABI namespace used by this front end. */
-namespace abi = u42::abi::v2;
+namespace abi = u42::abi::v3;
 
 /**
  * @brief Process exit codes; a rejected command line stays separable from a runtime failure.
@@ -262,8 +263,8 @@ void print_usage(std::ostream& out)
            "行为:\n"
            "  - 命令行先被完整校验，之后才会加载任何插件动态库。\n"
            "  - 调用成功时，插件返回的 JSON 原样写到 stdout（仅在其不以换行结尾时补一个换行）。\n"
-           "  - 调用前先用 u42::host::protocol() 发现提供者当前协议，再把该协议传给一次性调用；\n"
-           "    本次命令按发现结果原样接受，不从插件版本号推测协议，也不代表长期消费者策略。\n"
+           "  - 调用前先用 u42::host::version() 发现提供者当前版本，再把 exact_version(actual) 传给一次性调用；\n"
+           "    本次命令按发现结果原样接受，不代表长期消费者自动接受后续升级。\n"
            "  - 失败时 stderr 输出 'error: <stage>: <status>: <host 诊断>'。\n"
            "  - 结束后显式 shutdown；shutdown 失败同样以非零退出。\n"
            "\n"
@@ -278,11 +279,10 @@ void print_usage(std::ostream& out)
  * @return Process exit code; non-zero as soon as booting, the action or shutdown fails.
  * @note A failed boot has already rolled its batch back, so the constructor's teardown covers the
  *       remaining resources; a successful boot is always followed by an explicit shutdown.
- * @note A call action first discovers the current protocol through u42::host::protocol(): the
- *       release version says nothing about the business contract, so the discovered value is
- *       passed explicitly to the one-shot host call. It is accepted as-is for that single command
- *       and proves nothing about later releases, because this front end is a one-shot management
- *       caller rather than a stateful consumer.
+ * @note A call action first discovers the current version through u42::host::version() and passes
+ *       exact_version(actual) to the one-shot host call. That exact range is accepted only for
+ *       this single command and proves nothing about later releases, because this front end is a
+ *       one-shot management caller rather than a stateful consumer.
  */
 int execute(const options& opts, const char* program)
 {
@@ -302,15 +302,16 @@ int execute(const options& opts, const char* program)
         for (const std::string& id : rack.plugins()) std::cout << id << '\n';
         std::cout.flush();
     } else {
-        // Ask the rack what the provider publishes right now, then pass that contract to the
-        // one-shot call: neither the plug version nor a cached earlier contract is used here.
-        abi::contract required{};
-        const abi::status discovered = rack.protocol(opts.plug, &required);
+        // Ask the rack for the provider's current version, then require exactly that version for
+        // the one-shot call: no cached or inferred range is ever substituted here.
+        abi::plugin_version actual{};
+        const abi::status discovered = rack.version(opts.plug, &actual);
         if (discovered != abi::ok) {
-            std::cerr << "error: protocol " << opts.plug << ": "
+            std::cerr << "error: version " << opts.plug << ": "
                       << describe(discovered, rack.error()) << '\n';
             code = exit_failure;
         } else {
+            const abi::version_range required = abi::exact_version(actual);
             const abi::bytes args = as_bytes(opts.json);
             std::string result;
             abi::status called = abi::failed;

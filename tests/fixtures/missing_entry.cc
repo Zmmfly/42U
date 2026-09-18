@@ -3,7 +3,7 @@
  * @brief Negative fixture: a valid library that exports no u42_get_factory entry.
  *
  * The ABI header is deliberately not included: it declares a dllexport'd u42_get_factory for
- * the current profile (<42u/abi.hpp> now declares it for u42::abi::v2), which would turn this
+ * the current profile (<42u/abi.hpp> now declares it for u42::abi::v3), which would turn this
  * fixture into an unresolved-export link error. The library therefore only carries one
  * unrelated symbol, so the loader failure can be attributed to the missing entry point rather
  * than to a mapping failure.

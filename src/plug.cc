@@ -138,28 +138,28 @@ void unmap_library(void* handle) noexcept
  * @param error Human-readable diagnostic; written only on failure.
  * @return Entry point, or null when the symbol is missing or resolves to null.
  */
-abi::v2::entry_fn resolve_entry(void* handle, std::string& error)
+abi::v3::entry_fn resolve_entry(void* handle, std::string& error)
 {
 #if defined(_WIN32)
-    const FARPROC symbol = ::GetProcAddress(static_cast<HMODULE>(handle), abi::v2::entry_name);
+    const FARPROC symbol = ::GetProcAddress(static_cast<HMODULE>(handle), abi::v3::entry_name);
     if (symbol == nullptr) {
-        error = "cannot resolve " + std::string(abi::v2::entry_name) + ": " + last_error_message();
+        error = "cannot resolve " + std::string(abi::v3::entry_name) + ": " + last_error_message();
         return nullptr;
     }
-    return reinterpret_cast<abi::v2::entry_fn>(symbol);
+    return reinterpret_cast<abi::v3::entry_fn>(symbol);
 #else
     ::dlerror(); // Clear stale state so the next diagnostic belongs to this lookup.
-    void* symbol = ::dlsym(handle, abi::v2::entry_name);
+    void* symbol = ::dlsym(handle, abi::v3::entry_name);
     const char* diagnostic = ::dlerror();
     if (diagnostic != nullptr) {
-        error = "cannot resolve " + std::string(abi::v2::entry_name) + ": " + diagnostic;
+        error = "cannot resolve " + std::string(abi::v3::entry_name) + ": " + diagnostic;
         return nullptr;
     }
     if (symbol == nullptr) {
-        error = std::string(abi::v2::entry_name) + " resolves to null";
+        error = std::string(abi::v3::entry_name) + " resolves to null";
         return nullptr;
     }
-    return reinterpret_cast<abi::v2::entry_fn>(symbol);
+    return reinterpret_cast<abi::v3::entry_fn>(symbol);
 #endif
 }
 
@@ -188,58 +188,58 @@ plug& plug::operator=(plug&& other) noexcept
     return *this;
 }
 
-abi::v2::status plug::open(const std::filesystem::path& path, std::string& error)
+abi::v3::status plug::open(const std::filesystem::path& path, std::string& error)
 {
     error.clear();
     if (handle_ != nullptr) {
         error = "library already open: '" + path_.string() + "'";
-        return abi::v2::invalid_state;
+        return abi::v3::invalid_state;
     }
     if (path.empty()) {
         error = "plugin library path is empty";
-        return abi::v2::invalid_argument;
+        return abi::v3::invalid_argument;
     }
 
     std::error_code ec;
     std::filesystem::path canonical = std::filesystem::canonical(path, ec);
     if (ec) {
         error = "cannot resolve plugin library '" + path.string() + "': " + ec.message();
-        return ec == std::errc::no_such_file_or_directory ? abi::v2::not_found : abi::v2::failed;
+        return ec == std::errc::no_such_file_or_directory ? abi::v3::not_found : abi::v3::failed;
     }
 
     std::string diagnostic;
     void* handle = map_library(canonical, diagnostic);
     if (handle == nullptr) {
         error = diagnostic;
-        return abi::v2::failed;
+        return abi::v3::failed;
     }
 
-    abi::v2::entry_fn entry = resolve_entry(handle, diagnostic);
+    abi::v3::entry_fn entry = resolve_entry(handle, diagnostic);
     if (entry == nullptr) {
         error = diagnostic;
         unmap_library(handle);
-        return abi::v2::failed;
+        return abi::v3::failed;
     }
 
-    abi::v2::iplug_fty* factory = nullptr;
-    const abi::v2::status negotiated = entry(abi::v2::abi_major, &factory);
-    if (negotiated != abi::v2::ok) {
+    abi::v3::iplug_fty* factory = nullptr;
+    const abi::v3::status negotiated = entry(abi::v3::abi_major, &factory);
+    if (negotiated != abi::v3::ok) {
         error = "ABI negotiation failed for '" + canonical.string() + "': requested major " +
-                std::to_string(abi::v2::abi_major) + ", library returned status " +
+                std::to_string(abi::v3::abi_major) + ", library returned status " +
                 std::to_string(negotiated);
         unmap_library(handle);
-        return abi::v2::unsupported;
+        return abi::v3::unsupported;
     }
     if (factory == nullptr) {
         error = "u42_get_factory returned a null factory for '" + canonical.string() + "'";
         unmap_library(handle);
-        return abi::v2::failed;
+        return abi::v3::failed;
     }
 
     handle_ = handle;
     factory_ = factory;
     path_ = std::move(canonical);
-    return abi::v2::ok;
+    return abi::v3::ok;
 }
 
 void plug::close() noexcept
@@ -251,7 +251,7 @@ void plug::close() noexcept
     unmap_library(handle);
 }
 
-abi::v2::status scan_plugins(const std::filesystem::path& directory,
+abi::v3::status scan_plugins(const std::filesystem::path& directory,
                             std::vector<std::filesystem::path>& out, std::string& error)
 {
     namespace fs = std::filesystem;
@@ -261,25 +261,25 @@ abi::v2::status scan_plugins(const std::filesystem::path& directory,
 
     if (directory.empty()) {
         error = "plugin directory is empty";
-        return abi::v2::invalid_argument;
+        return abi::v3::invalid_argument;
     }
 
     std::error_code ec;
     if (!fs::exists(directory, ec)) {
         if (ec) {
             error = "cannot inspect plugin directory '" + directory.string() + "': " + ec.message();
-            return abi::v2::failed;
+            return abi::v3::failed;
         }
         error = "plugin directory does not exist: '" + directory.string() + "'";
-        return abi::v2::not_found;
+        return abi::v3::not_found;
     }
     if (!fs::is_directory(directory, ec)) {
         if (ec) {
             error = "cannot inspect plugin directory '" + directory.string() + "': " + ec.message();
-            return abi::v2::failed;
+            return abi::v3::failed;
         }
         error = "plugin path is not a directory: '" + directory.string() + "'";
-        return abi::v2::invalid_argument;
+        return abi::v3::invalid_argument;
     }
 
     std::vector<fs::path> candidates;
@@ -287,7 +287,7 @@ abi::v2::status scan_plugins(const std::filesystem::path& directory,
     for (fs::directory_iterator it(directory, ec); it != end; it.increment(ec)) {
         if (ec) {
             error = "cannot read plugin directory '" + directory.string() + "': " + ec.message();
-            return abi::v2::failed;
+            return abi::v3::failed;
         }
 
         const fs::directory_entry& entry = *it;
@@ -295,7 +295,7 @@ abi::v2::status scan_plugins(const std::filesystem::path& directory,
         if (ec) {
             error = "cannot inspect plugin candidate '" + entry.path().string() + "': " +
                     ec.message();
-            return abi::v2::failed;
+            return abi::v3::failed;
         }
         if (!regular || !has_plugin_suffix(entry.path())) continue;
 
@@ -303,7 +303,7 @@ abi::v2::status scan_plugins(const std::filesystem::path& directory,
         if (ec) {
             error = "cannot resolve plugin candidate '" + entry.path().string() + "': " +
                     ec.message();
-            return abi::v2::failed;
+            return abi::v3::failed;
         }
         candidates.push_back(std::move(canonical));
     }
@@ -315,7 +315,7 @@ abi::v2::status scan_plugins(const std::filesystem::path& directory,
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 
     out = std::move(candidates);
-    return abi::v2::ok;
+    return abi::v3::ok;
 }
 
 } // namespace u42

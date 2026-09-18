@@ -56,9 +56,9 @@ struct utf8_less {
  * @param initialized Already initialized identities.
  * @param out Receives indices into nodes in planned order.
  * @param error Receives a specific diagnostic on failure.
- * @return abi::v2::ok on success, otherwise the first detected violation.
+ * @return abi::v3::ok on success, otherwise the first detected violation.
  */
-abi::v2::status plan_order_impl(const std::vector<order_node>& nodes,
+abi::v3::status plan_order_impl(const std::vector<order_node>& nodes,
                                const std::vector<std::string>& initialized,
                                std::vector<std::size_t>& out, std::string& error)
 {
@@ -70,26 +70,26 @@ abi::v2::status plan_order_impl(const std::vector<order_node>& nodes,
         const std::string& id = nodes[i].plug_id;
         if (id.empty()) {
             error = "pending node " + std::to_string(i) + " has an empty plug_id";
-            return abi::v2::invalid_argument;
+            return abi::v3::invalid_argument;
         }
         if (!pending.emplace(id, i).second) {
             error = "duplicate pending plug_id '" + id + "'";
-            return abi::v2::duplicate;
+            return abi::v3::duplicate;
         }
     }
     for (std::size_t i = 0; i < initialized.size(); ++i) {
         const std::string& id = initialized[i];
         if (id.empty()) {
             error = "initialized entry " + std::to_string(i) + " has an empty plug_id";
-            return abi::v2::invalid_argument;
+            return abi::v3::invalid_argument;
         }
         if (!settled.insert(id).second) {
             error = "duplicate initialized plug_id '" + id + "'";
-            return abi::v2::duplicate;
+            return abi::v3::duplicate;
         }
         if (pending.find(id) != pending.end()) {
             error = "plug_id '" + id + "' is both pending and initialized";
-            return abi::v2::duplicate;
+            return abi::v3::duplicate;
         }
     }
 
@@ -110,25 +110,25 @@ abi::v2::status plan_order_impl(const std::vector<order_node>& nodes,
         for (const std::string& target : node.before) {
             if (target == node.plug_id) {
                 error = "plugin '" + node.plug_id + "' lists itself in before";
-                return abi::v2::cycle;
+                return abi::v3::cycle;
             }
             if (settled.find(target) != settled.end()) {
                 error = "plugin '" + node.plug_id + "' cannot start before already initialized '" +
                         target + "'";
-                return abi::v2::invalid_state;
+                return abi::v3::invalid_state;
             }
             const auto found = pending.find(target);
             if (found == pending.end()) {
                 error = "plugin '" + node.plug_id + "' declares unknown before target '" + target +
                         "'";
-                return abi::v2::not_found;
+                return abi::v3::not_found;
             }
             add_edge(i, found->second);
         }
         for (const std::string& target : node.after) {
             if (target == node.plug_id) {
                 error = "plugin '" + node.plug_id + "' lists itself in after";
-                return abi::v2::cycle;
+                return abi::v3::cycle;
             }
             // An initialized target already satisfies the constraint; it adds no edge.
             if (settled.find(target) != settled.end()) continue;
@@ -136,7 +136,7 @@ abi::v2::status plan_order_impl(const std::vector<order_node>& nodes,
             if (found == pending.end()) {
                 error = "plugin '" + node.plug_id + "' declares unknown after target '" + target +
                         "'";
-                return abi::v2::not_found;
+                return abi::v3::not_found;
             }
             add_edge(found->second, i);
         }
@@ -184,14 +184,14 @@ abi::v2::status plan_order_impl(const std::vector<order_node>& nodes,
         }
         error = "dependency cycle; unplannable pending plugins: " + list;
         out.clear();
-        return abi::v2::cycle;
+        return abi::v3::cycle;
     }
-    return abi::v2::ok;
+    return abi::v3::ok;
 }
 
 } // namespace
 
-abi::v2::status plan_order(const std::vector<order_node>& nodes,
+abi::v3::status plan_order(const std::vector<order_node>& nodes,
                           const std::vector<std::string>& initialized,
                           std::vector<std::size_t>& out, std::string& error)
 {
@@ -202,11 +202,11 @@ abi::v2::status plan_order(const std::vector<order_node>& nodes,
     } catch (const std::bad_alloc&) {
         out.clear();
         error = "out of memory while planning the plugin order";
-        return abi::v2::failed;
+        return abi::v3::failed;
     } catch (...) {
         out.clear();
         error = "unexpected exception while planning the plugin order";
-        return abi::v2::failed;
+        return abi::v3::failed;
     }
 }
 } // namespace u42
