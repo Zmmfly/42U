@@ -26,9 +26,25 @@ struct capability_set {
 };
 
 /**
+ * @brief Immutable per-plugin configuration with ABI views built before instance creation.
+ *
+ * @note The owning strings and their view arrays never move after construction. iconfig methods
+ *       can therefore return stable borrowed views without allocating or using scratch storage.
+ */
+struct config_snapshot {
+    /** @brief Host-owned keys, metadata and value strings in stable manifest order. */
+    std::vector<plugin_config_value> values;
+    /** @brief Per-entry borrowed value views pointing into values. */
+    std::vector<std::vector<cli::v1::text_view>> value_views;
+    /** @brief ABI entries pointing into values and value_views. */
+    std::vector<cli::v1::config_entry> entries;
+};
+
+/**
  * @brief One stable per-instance context; a null owner is the host administration context.
  */
-struct context final : a::ictx, a::ievents, a::icaps, a::icalls, a::idiag {
+struct context final : a::ictx, a::ievents, a::icaps, a::icalls, a::idiag,
+                       cli::v1::iconfig {
     engine& runtime;
     record* owner;
     explicit context(engine& e, record* p) : runtime(e), owner(p) {}
@@ -44,12 +60,18 @@ struct context final : a::ictx, a::ievents, a::icaps, a::icalls, a::idiag {
     a::status U42_CALL call_name(a::token, const char*, a::bytes, a::iwriter*) noexcept override;
     a::status U42_CALL call_id(a::token, a::method_id, a::bytes, a::iwriter*) noexcept override;
     void U42_CALL log(const char*) noexcept override;
+    /** @brief Return every value in this context owner's frozen configuration snapshot. */
+    a::status U42_CALL entries(cli::v1::array_view<cli::v1::config_entry>*) noexcept override;
+    /** @brief Find one exact key in this context owner's frozen configuration snapshot. */
+    a::status U42_CALL get(cli::v1::text_view, cli::v1::config_entry*) noexcept override;
 };
 
 struct record {
     std::unique_ptr<plug> library;
     a::iplug_fty* factory = nullptr;
     a::iplug* instance = nullptr;
+    /** @brief Owner-local immutable configuration; destroyed after ctx and before the DSO. */
+    std::unique_ptr<const config_snapshot> config;
     std::unique_ptr<context> ctx;
     order_node order;
     a::plugin_version version{};
@@ -107,6 +129,19 @@ struct engine {
     a::status fail(a::status value, const std::string& message) { error = message; return value; }
     // Lifecycle owner: src/host.cc.
     a::status stage(a::iplug_fty*, std::unique_ptr<plug> library = {});
+    /**
+     * @brief Create one record from discovery-owned metadata and an already frozen snapshot.
+     *
+     * @param factory Borrowed factory kept alive by library when dynamically loaded.
+     * @param order Host-owned identity and lifecycle constraints.
+     * @param version Exact business version published by the discovered factory.
+     * @param library Optional owned DSO mapping; null for a static factory.
+     * @param config Required immutable configuration snapshot.
+     * @return ok after create(), otherwise a staging or factory error.
+     */
+    a::status stage(a::iplug_fty* factory, order_node order, a::plugin_version version,
+                    std::unique_ptr<plug> library,
+                    std::unique_ptr<const config_snapshot> config);
     a::status start_pending();
     a::status unload_one(const std::string&);
     a::status shutdown_all();

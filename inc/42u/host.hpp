@@ -1,5 +1,7 @@
 #pragma once
 #include <42u/abi.hpp>
+#include <42u/cli.hpp>
+#include <42u/plug.hpp>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -7,6 +9,41 @@
 
 namespace u42 {
 namespace detail { struct engine; }
+
+/**
+ * @brief One host-owned value in a plugin's frozen configuration snapshot.
+ *
+ * @note The containing plugin_activation determines the owning plugin. Keys must be declared by
+ *       that discovered plugin's CLI manifest; values are copied into runtime-owned storage before
+ *       any plugin instance is created.
+ */
+struct plugin_config_value {
+    /** @brief Stable plugin-local configuration key. */
+    std::string key;
+    /** @brief Value representation, currently cli::v1::text or cli::v1::flag. */
+    cli::v1::parameter_kind kind = cli::v1::text;
+    /** @brief Whether the value came from a plugin default or an explicit command line. */
+    cli::v1::config_source source = cli::v1::plugin_default;
+    /** @brief Configuration metadata flags, currently cli::v1::config_sensitive only. */
+    cli::v1::flag_bits flags = 0;
+    /** @brief Ordered text occurrences; flags contain one canonical true/false value. */
+    std::vector<std::string> values;
+};
+
+/**
+ * @brief One discovered library and the configuration snapshot assigned to its plugin identity.
+ *
+ * @note Ownership of the discovered library transfers to host::adopt() by move. A rejected batch
+ *       is released without creating instances; a successful batch keeps each mapping until its
+ *       instance has been safely destroyed.
+ */
+struct plugin_activation {
+    /** @brief Validated discovery result whose DSO mapping has not yet been transferred. */
+    discovered_plugin plugin;
+    /** @brief Values visible only through this plugin instance's iconfig service. */
+    std::vector<plugin_config_value> config;
+};
+
 /**
  * @brief Bounded host resources; all operations run on the constructing thread.
  */
@@ -60,6 +97,17 @@ public:
      */
     abi::v3::status add(abi::v3::iplug_fty* factory);
     /**
+     * @brief Atomically validate a discovered batch, then create every configured instance.
+     *
+     * @param activations Move-owned discovery records and per-plugin configuration snapshots.
+     * @return ok after every instance reaches Created; busy on callback reentry; otherwise a
+     *         metadata, conflict, configuration, ownership, allocation, or create error.
+     * @note The complete batch is validated and every frozen snapshot is built before the first
+     *       create() call. A later create failure destroys only instances created by this call in
+     *       reverse transfer order; records that existed before this call are never rolled back.
+     */
+    abi::v3::status adopt(std::vector<plugin_activation> activations);
+    /**
      * @brief Scan and eagerly stage every candidate before initialization, then start the batch.
      *
      * @param directory Non-recursive directory of platform-specific .u42 libraries.
@@ -78,9 +126,9 @@ public:
      * @note Capability notices dispatch between starts, allowing Initialized consumers to save
      *       borrowings but not invoke business methods. Deferred unloads stay queued throughout
      *       planning, init, start and rollback; a later poll() or safe teardown can consume them.
-     *       Lifecycle failure rolls back this pending batch, retaining unsafe resources. Cleanup
-     *       is best effort: allocation failure before planning or during rollback may leave Created
-     *       or quarantined records for retry/shutdown; failed is not a strong rollback guarantee.
+     *       Lifecycle failure rolls back this pending batch, retaining unsafe resources; allocation
+     *       failure before planning or during rollback may leave Created or quarantined records for
+     *       retry or shutdown.
      */
     abi::v3::status start();
     /**

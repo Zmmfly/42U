@@ -196,6 +196,534 @@ a::status read_constraints(const char* const* items, std::uint32_t count, const 
 }
 
 /**
+ * @brief Validate one host-owned stable configuration identifier.
+ *
+ * @param value Candidate key copied from the CLI frontend.
+ * @return true when the key follows the manifest v1 stable-identifier grammar.
+ */
+bool valid_config_key(const std::string& value) noexcept
+{
+    if (value.empty() || value.size() > cli::v1::max_identifier_bytes) return false;
+    const auto ascii_letter = [](unsigned char ch) noexcept {
+        return (ch >= static_cast<unsigned char>('A') && ch <= static_cast<unsigned char>('Z')) ||
+               (ch >= static_cast<unsigned char>('a') && ch <= static_cast<unsigned char>('z'));
+    };
+    const auto ascii_digit = [](unsigned char ch) noexcept {
+        return ch >= static_cast<unsigned char>('0') && ch <= static_cast<unsigned char>('9');
+    };
+    if (!ascii_letter(static_cast<unsigned char>(value.front()))) return false;
+    for (const unsigned char ch : value) {
+        if (!ascii_letter(ch) && !ascii_digit(ch) && ch != static_cast<unsigned char>('_') &&
+            ch != static_cast<unsigned char>('-') && ch != static_cast<unsigned char>('.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** @brief Compare a bounded manifest string view with one host-owned string. */
+bool view_equals(cli::v1::text_view view, const std::string& value) noexcept
+{
+    return cli::v1::valid_view(view) && view.size == value.size() &&
+           (view.size == 0 || std::memcmp(view.data, value.data(), value.size()) == 0);
+}
+
+/** @brief Compare two borrowed manifest text views without allocating. */
+bool views_equal(cli::v1::text_view left, cli::v1::text_view right) noexcept
+{
+    return cli::v1::valid_view(left) && cli::v1::valid_view(right) &&
+           left.size == right.size &&
+           (left.size == 0 ||
+            std::memcmp(left.data, right.data, static_cast<std::size_t>(left.size)) == 0);
+}
+
+/** @brief One validated configuration declaration borrowed from a discovered manifest. */
+struct config_declaration {
+    const cli::v1::parameter_desc* parameter = nullptr;
+    cli::v1::text_view key{};
+    std::size_t ordinal = 0;
+    std::uint64_t command = 0;
+    bool root = false;
+};
+
+/**
+ * @brief Validate one borrowed manifest string as bounded NUL-free UTF-8.
+ */
+a::status validate_manifest_text(cli::v1::text_view value, std::uint64_t limit,
+                                 bool required, const std::string& field,
+                                 std::string& message)
+{
+    if (!cli::v1::valid_view(value)) {
+        message = field + " has a null pointer with a non-zero size";
+        return a::invalid_argument;
+    }
+    if (value.size > limit) {
+        message = field + " exceeds its manifest v1 byte limit";
+        return a::limit_exceeded;
+    }
+    if (value.size == 0) {
+        if (required) {
+            message = field + " must not be empty";
+            return a::invalid_argument;
+        }
+        return a::ok;
+    }
+    if (std::memchr(value.data, '\0', static_cast<std::size_t>(value.size)) != nullptr ||
+        !valid_utf8(value.data, static_cast<std::size_t>(value.size))) {
+        message = field + " is not NUL-free valid UTF-8";
+        return a::invalid_argument;
+    }
+    return a::ok;
+}
+
+/** @brief Validate one stable configuration key borrowed from a manifest. */
+bool valid_config_key(cli::v1::text_view value) noexcept
+{
+    if (!cli::v1::valid_view(value) || value.size == 0 ||
+        value.size > cli::v1::max_identifier_bytes) {
+        return false;
+    }
+    const auto ascii_letter = [](unsigned char ch) noexcept {
+        return (ch >= static_cast<unsigned char>('A') && ch <= static_cast<unsigned char>('Z')) ||
+               (ch >= static_cast<unsigned char>('a') && ch <= static_cast<unsigned char>('z'));
+    };
+    const auto ascii_digit = [](unsigned char ch) noexcept {
+        return ch >= static_cast<unsigned char>('0') && ch <= static_cast<unsigned char>('9');
+    };
+    if (!ascii_letter(static_cast<unsigned char>(value.data[0]))) return false;
+    for (std::uint64_t index = 0; index < value.size; ++index) {
+        const unsigned char ch = static_cast<unsigned char>(value.data[index]);
+        if (!ascii_letter(ch) && !ascii_digit(ch) && ch != static_cast<unsigned char>('_') &&
+            ch != static_cast<unsigned char>('-') && ch != static_cast<unsigned char>('.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** @brief Validate one manifest default/allowed-value array and every UTF-8 element. */
+a::status validate_declared_values(cli::v1::array_view<cli::v1::text_view> values,
+                                   std::uint64_t count_limit, const std::string& field,
+                                   std::string& message)
+{
+    if (!cli::v1::valid_view(values)) {
+        message = field + " has a null array with a non-zero count";
+        return a::invalid_argument;
+    }
+    if (values.size > count_limit) {
+        message = field + " exceeds its manifest v1 entry limit";
+        return a::limit_exceeded;
+    }
+    for (std::uint64_t index = 0; index < values.size; ++index) {
+        const a::status checked = validate_manifest_text(
+            values.data[index], cli::v1::max_declared_value_bytes, false,
+            field + "[" + std::to_string(index) + "]", message);
+        if (checked != a::ok) return checked;
+    }
+    return a::ok;
+}
+
+/** @brief Test whether one declared-value array contains an exact host-owned value. */
+bool declared_values_contain(cli::v1::array_view<cli::v1::text_view> declared,
+                             const std::string& value) noexcept
+{
+    for (std::uint64_t index = 0; index < declared.size; ++index) {
+        if (view_equals(declared.data[index], value)) return true;
+    }
+    return false;
+}
+
+/** @brief Test whether runtime values exactly equal one declaration's ordered defaults. */
+bool defaults_equal(cli::v1::array_view<cli::v1::text_view> defaults,
+                    const std::vector<std::string>& values) noexcept
+{
+    if (defaults.size != values.size()) return false;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (!view_equals(defaults.data[index], values[index])) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Validate all manifest structure relevant to configuration and collect declarations.
+ */
+a::status collect_config_declarations(const cli::v1::manifest* manifest,
+                                      std::vector<config_declaration>& declarations,
+                                      std::string& message)
+{
+    declarations.clear();
+    if (manifest == nullptr) return a::ok;
+    if (manifest->struct_size != sizeof(cli::v1::manifest) || manifest->reserved != 0 ||
+        !cli::v1::valid_manifest_flags(manifest->flags) ||
+        !cli::v1::valid_view(manifest->root_parameters) ||
+        !cli::v1::valid_view(manifest->commands)) {
+        message = "the owning CLI manifest is malformed";
+        return a::invalid_argument;
+    }
+    if (manifest->root_parameters.size > cli::v1::max_root_parameters ||
+        manifest->commands.size > cli::v1::max_commands) {
+        message = "the owning CLI manifest exceeds v1 declaration limits";
+        return a::limit_exceeded;
+    }
+
+    const auto validate_parameter = [&](const cli::v1::parameter_desc& parameter,
+                                        const std::string& field) -> a::status {
+        if (parameter.struct_size != sizeof(cli::v1::parameter_desc) ||
+            parameter.reserved != 0 || !cli::v1::valid_parameter_kind(parameter.kind) ||
+            !cli::v1::valid_parameter_flags(parameter.flags)) {
+            message = field + " has malformed metadata";
+            return a::invalid_argument;
+        }
+        a::status checked = validate_manifest_text(parameter.param_id,
+                                                   cli::v1::max_identifier_bytes, true,
+                                                   field + ".param_id", message);
+        if (checked != a::ok) return checked;
+        if (!valid_config_key(parameter.param_id)) {
+            message = field + ".param_id is not a stable identifier";
+            return a::invalid_argument;
+        }
+        checked = validate_manifest_text(parameter.long_name, cli::v1::max_cli_name_bytes,
+                                         false, field + ".long_name", message);
+        if (checked != a::ok) return checked;
+        checked = validate_manifest_text(parameter.help, cli::v1::max_help_bytes, false,
+                                         field + ".help", message);
+        if (checked != a::ok) return checked;
+        checked = validate_manifest_text(parameter.value_name, cli::v1::max_value_name_bytes,
+                                         false, field + ".value_name", message);
+        if (checked != a::ok) return checked;
+        checked = validate_manifest_text(parameter.config_key, cli::v1::max_identifier_bytes,
+                                         false, field + ".config_key", message);
+        if (checked != a::ok) return checked;
+        if (parameter.config_key.size != 0 && !valid_config_key(parameter.config_key)) {
+            message = field + ".config_key is not a stable identifier";
+            return a::invalid_argument;
+        }
+        checked = validate_declared_values(parameter.default_values,
+                                           cli::v1::max_default_values,
+                                           field + ".default_values", message);
+        if (checked != a::ok) return checked;
+        checked = validate_declared_values(parameter.allowed_values,
+                                           cli::v1::max_allowed_values,
+                                           field + ".allowed_values", message);
+        if (checked != a::ok) return checked;
+
+        if (parameter.kind == cli::v1::flag) {
+            if ((parameter.flags & cli::v1::parameter_repeatable) != 0 ||
+                parameter.default_values.size != 0 || parameter.allowed_values.size != 0) {
+                message = field + " has invalid flag value constraints";
+                return a::invalid_argument;
+            }
+        } else if ((parameter.flags & cli::v1::parameter_repeatable) == 0 &&
+                   parameter.default_values.size > 1) {
+            message = field + " is not repeatable but declares multiple defaults";
+            return a::invalid_argument;
+        }
+        for (std::uint64_t index = 0; index < parameter.allowed_values.size; ++index) {
+            for (std::uint64_t earlier = 0; earlier < index; ++earlier) {
+                if (views_equal(parameter.allowed_values.data[index],
+                                parameter.allowed_values.data[earlier])) {
+                    message = field + " repeats an allowed value";
+                    return a::duplicate;
+                }
+            }
+        }
+        if (parameter.allowed_values.size != 0) {
+            for (std::uint64_t index = 0; index < parameter.default_values.size; ++index) {
+                const cli::v1::text_view item = parameter.default_values.data[index];
+                bool allowed = false;
+                for (std::uint64_t allowed_index = 0;
+                     allowed_index < parameter.allowed_values.size; ++allowed_index) {
+                    if (views_equal(item, parameter.allowed_values.data[allowed_index])) {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if (!allowed) {
+                    message = field + " has a default outside its allowed values";
+                    return a::invalid_argument;
+                }
+            }
+        }
+        return a::ok;
+    };
+
+    const auto add_declaration = [&](const cli::v1::parameter_desc& parameter,
+                                     cli::v1::text_view key, bool root,
+                                     std::uint64_t command) -> a::status {
+        for (const config_declaration& known : declarations) {
+            if (!views_equal(known.key, key)) continue;
+            if (root || known.root || known.command == command) {
+                message = "configuration key is repeated within one configuration scope";
+                return a::duplicate;
+            }
+            const cli::v1::flag_bits sensitive =
+                parameter.flags & cli::v1::parameter_sensitive;
+            const cli::v1::flag_bits known_sensitive =
+                known.parameter->flags & cli::v1::parameter_sensitive;
+            if (parameter.kind != known.parameter->kind || sensitive != known_sensitive) {
+                message = "configuration key reused across commands has incompatible kind or sensitivity";
+                return a::invalid_argument;
+            }
+        }
+        declarations.push_back(
+            config_declaration{&parameter, key, declarations.size(), command, root});
+        return a::ok;
+    };
+
+    declarations.reserve(static_cast<std::size_t>(manifest->root_parameters.size));
+    for (std::uint64_t index = 0; index < manifest->root_parameters.size; ++index) {
+        const cli::v1::parameter_desc& parameter = manifest->root_parameters.data[index];
+        const a::status checked = validate_parameter(
+            parameter, "root parameter[" + std::to_string(index) + "]");
+        if (checked != a::ok) return checked;
+        if (parameter.config_key.size != 0) {
+            message = "a root parameter must not declare config_key";
+            return a::invalid_argument;
+        }
+        if ((parameter.flags & cli::v1::parameter_required) != 0) {
+            message = "a root parameter must not be required";
+            return a::invalid_argument;
+        }
+        const a::status added = add_declaration(parameter, parameter.param_id, true, 0);
+        if (added != a::ok) return added;
+    }
+
+    for (std::uint64_t command_index = 0; command_index < manifest->commands.size;
+         ++command_index) {
+        const cli::v1::command_desc& command = manifest->commands.data[command_index];
+        if (command.struct_size != sizeof(cli::v1::command_desc) || command.reserved != 0 ||
+            command.reserved_handler != 0 || !cli::v1::valid_command_flags(command.flags) ||
+            !cli::v1::valid_view(command.parameters)) {
+            message = "the owning CLI manifest contains a malformed command declaration";
+            return a::invalid_argument;
+        }
+        if (command.parameters.size > cli::v1::max_command_parameters) {
+            message = "the owning CLI manifest exceeds the command parameter limit";
+            return a::limit_exceeded;
+        }
+        a::status checked = validate_manifest_text(command.command_id,
+                                                   cli::v1::max_identifier_bytes, true,
+                                                   "command.command_id", message);
+        if (checked != a::ok) return checked;
+        checked = validate_manifest_text(command.name, cli::v1::max_cli_name_bytes, true,
+                                         "command.name", message);
+        if (checked != a::ok) return checked;
+        checked = validate_manifest_text(command.help, cli::v1::max_help_bytes, false,
+                                         "command.help", message);
+        if (checked != a::ok) return checked;
+        for (std::uint64_t parameter_index = 0; parameter_index < command.parameters.size;
+             ++parameter_index) {
+            const cli::v1::parameter_desc& parameter = command.parameters.data[parameter_index];
+            checked = validate_parameter(
+                parameter, "command[" + std::to_string(command_index) + "].parameter[" +
+                               std::to_string(parameter_index) + "]");
+            if (checked != a::ok) return checked;
+            if (parameter.config_key.size == 0) continue;
+            checked = add_declaration(parameter, parameter.config_key, false, command_index);
+            if (checked != a::ok) return checked;
+        }
+    }
+    return a::ok;
+}
+
+/**
+ * @brief Validate that one configuration value is declared by its owning plugin manifest.
+ *
+ * @param declarations Validated declarations from the same discovered library.
+ * @param value Host-owned configuration value to validate.
+ * @param[out] ordinal Stable manifest-order index for snapshot enumeration.
+ * @param[out] message Human-readable failure diagnostic.
+ * @return ok when at least one declaration has compatible kind and sensitivity metadata,
+ *         otherwise an ABI validation status.
+ */
+a::status validate_config_owner(const std::vector<config_declaration>& declarations,
+                                const plugin_config_value& value, std::size_t& ordinal,
+                                std::string& message)
+{
+    bool key_found = false;
+    bool kind_found = false;
+    bool compatible_found = false;
+    bool cardinality_found = false;
+    bool allowed_found = false;
+    std::size_t compatible_ordinal = 0;
+    for (const config_declaration& declaration : declarations) {
+        const cli::v1::parameter_desc& parameter = *declaration.parameter;
+        if (!view_equals(declaration.key, value.key)) continue;
+        key_found = true;
+        if (parameter.kind != value.kind) continue;
+        kind_found = true;
+        const cli::v1::flag_bits expected_flags =
+            (parameter.flags & cli::v1::parameter_sensitive) != 0
+                ? cli::v1::config_sensitive
+                : 0;
+        if (value.flags != expected_flags) continue;
+        if (!compatible_found) {
+            compatible_found = true;
+            compatible_ordinal = declaration.ordinal;
+        }
+        if (value.values.size() > 1 &&
+            (parameter.flags & cli::v1::parameter_repeatable) == 0) {
+            continue;
+        }
+        cardinality_found = true;
+        bool allowed = true;
+        if (parameter.allowed_values.size != 0) {
+            for (const std::string& item : value.values) {
+                if (!declared_values_contain(parameter.allowed_values, item)) {
+                    allowed = false;
+                    break;
+                }
+            }
+        }
+        if (!allowed) continue;
+        allowed_found = true;
+        if (value.source == cli::v1::plugin_default &&
+            !defaults_equal(parameter.default_values, value.values)) {
+            continue;
+        }
+        ordinal = compatible_ordinal;
+        return a::ok;
+    }
+
+    if (!key_found) {
+        message = "configuration key '" + value.key + "' is not declared by its owning plugin";
+        return a::invalid_argument;
+    }
+    if (!kind_found) {
+        message = "configuration key '" + value.key + "' has the wrong value kind";
+        return a::invalid_argument;
+    }
+    message = "configuration key '" + value.key +
+              "' has flags inconsistent with its declarations";
+    if (!compatible_found) return a::invalid_argument;
+    if (!cardinality_found) {
+        message = "configuration key '" + value.key +
+                  "' is not repeatable and requires exactly one value";
+        return a::invalid_argument;
+    }
+    if (!allowed_found) {
+        message = "configuration key '" + value.key +
+                  "' contains a value outside its allowed values";
+        return a::invalid_argument;
+    }
+    message = "configuration key '" + value.key +
+              "' does not match any declared plugin default";
+    return a::invalid_argument;
+}
+
+/**
+ * @brief Validate, order and freeze one plugin's complete configuration snapshot.
+ *
+ * @param plugin_id Owning plugin identity used in diagnostics.
+ * @param manifest Borrowed manifest from the same discovered library.
+ * @param values Caller-owned configuration values.
+ * @param[out] out Receives a fully self-contained snapshot with stable ABI views.
+ * @param[out] message Human-readable failure diagnostic.
+ * @return ok on success, otherwise a configuration validation status.
+ */
+a::status freeze_config(const std::string& plugin_id, const cli::v1::manifest* manifest,
+                        const std::vector<plugin_config_value>& values,
+                        std::unique_ptr<const config_snapshot>& out, std::string& message)
+{
+    out.reset();
+    std::vector<config_declaration> declarations;
+    a::status checked = collect_config_declarations(manifest, declarations, message);
+    if (checked != a::ok) return checked;
+    auto snapshot = std::make_unique<config_snapshot>();
+    if (values.empty()) {
+        out = std::move(snapshot);
+        return a::ok;
+    }
+
+    std::set<std::string> keys;
+    std::vector<std::pair<std::size_t, plugin_config_value>> ordered;
+    ordered.reserve(values.size());
+    for (const plugin_config_value& value : values) {
+        if (!valid_config_key(value.key)) {
+            message = "plugin '" + plugin_id + "' has an invalid configuration key";
+            return a::invalid_argument;
+        }
+        if (!keys.insert(value.key).second) {
+            message = "plugin '" + plugin_id + "' repeats configuration key '" + value.key + "'";
+            return a::duplicate;
+        }
+        if (!cli::v1::valid_parameter_kind(value.kind)) {
+            message = "plugin '" + plugin_id + "' configuration key '" + value.key +
+                      "' has an unknown kind";
+            return a::invalid_argument;
+        }
+        if (!cli::v1::valid_config_source(value.source)) {
+            message = "plugin '" + plugin_id + "' configuration key '" + value.key +
+                      "' has an unknown source";
+            return a::invalid_argument;
+        }
+        if (!cli::v1::valid_config_flags(value.flags)) {
+            message = "plugin '" + plugin_id + "' configuration key '" + value.key +
+                      "' has unknown flags";
+            return a::invalid_argument;
+        }
+        if (value.values.empty()) {
+            message = "plugin '" + plugin_id + "' configuration key '" + value.key +
+                      "' has no value";
+            return a::invalid_argument;
+        }
+        for (std::size_t index = 0; index < value.values.size(); ++index) {
+            const std::string& item = value.values[index];
+            if (std::memchr(item.data(), '\0', item.size()) != nullptr ||
+                !valid_utf8(item.data(), item.size())) {
+                message = "plugin '" + plugin_id + "' configuration key '" + value.key +
+                          "' value[" + std::to_string(index) +
+                          "] is not NUL-free valid UTF-8";
+                return a::invalid_argument;
+            }
+        }
+        if (value.kind == cli::v1::flag &&
+            (value.values.size() != 1 ||
+             (value.values.front() != "true" && value.values.front() != "false"))) {
+            message = "plugin '" + plugin_id + "' flag configuration key '" + value.key +
+                      "' must contain one canonical true/false value";
+            return a::invalid_argument;
+        }
+
+        std::size_t ordinal = 0;
+        const a::status owned = validate_config_owner(declarations, value, ordinal, message);
+        if (owned != a::ok) {
+            message = "plugin '" + plugin_id + "': " + message;
+            return owned;
+        }
+        ordered.emplace_back(ordinal, value);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto& left, const auto& right) { return left.first < right.first; });
+
+    snapshot->values.reserve(ordered.size());
+    for (auto& entry : ordered) snapshot->values.push_back(std::move(entry.second));
+    snapshot->value_views.resize(snapshot->values.size());
+    snapshot->entries.resize(snapshot->values.size());
+    for (std::size_t index = 0; index < snapshot->values.size(); ++index) {
+        const plugin_config_value& value = snapshot->values[index];
+        std::vector<cli::v1::text_view>& views = snapshot->value_views[index];
+        views.reserve(value.values.size());
+        for (const std::string& item : value.values) {
+            views.push_back(cli::v1::text_view{item.c_str(),
+                                               static_cast<std::uint64_t>(item.size())});
+        }
+
+        cli::v1::config_entry& entry = snapshot->entries[index];
+        entry.flags = value.flags;
+        entry.key = cli::v1::text_view{value.key.c_str(),
+                                       static_cast<std::uint64_t>(value.key.size())};
+        entry.kind = value.kind;
+        entry.source = value.source;
+        entry.values = cli::v1::array_view<cli::v1::text_view>{
+            views.empty() ? nullptr : views.data(), static_cast<std::uint64_t>(views.size())};
+    }
+
+    out = std::move(snapshot);
+    return a::ok;
+}
+
+/**
  * @brief Raise the host call depth around a plugin entry point that has no record yet.
  *
  * stage() has to call describe()/create() before the owning record exists, so call_scope cannot
@@ -867,6 +1395,28 @@ a::status engine::stage(a::iplug_fty* factory, std::unique_ptr<plug> library)
     status = read_constraints(desc->after, desc->after_count, "plug_desc after", node.after, message);
     if (status != a::ok) return fail(status, message);
 
+    return stage(factory, std::move(node), desc->version, std::move(library),
+                 std::make_unique<const config_snapshot>());
+}
+
+a::status engine::stage(a::iplug_fty* factory, order_node node, a::plugin_version version,
+                        std::unique_ptr<plug> library,
+                        std::unique_ptr<const config_snapshot> config)
+{
+    if (!on_thread()) return a::wrong_thread;
+    if (depth != 0) {
+        return refuse(*this, a::busy, "plugins cannot be staged from inside a plugin call");
+    }
+    if (factory == nullptr) return fail(a::invalid_argument, "staging requires a non-null factory");
+    if (!config) return fail(a::invalid_argument, "staging requires a frozen configuration snapshot");
+    if (shutting_down) return fail(a::invalid_state, "the host is shutting down and rejects new plugins");
+
+    const std::string id = node.plug_id;
+    if (id.empty() || id.size() > max_string_bytes ||
+        id.find('\0') != std::string::npos || !valid_utf8(id.data(), id.size())) {
+        return fail(a::invalid_argument, "staging requires a bounded non-empty UTF-8 plugin identity");
+    }
+
     if (records.count(id) != 0) {
         return fail(a::duplicate, "plugin identity '" + id + "' is already known to this host");
     }
@@ -882,9 +1432,10 @@ a::status engine::stage(a::iplug_fty* factory, std::unique_ptr<plug> library)
     auto fresh = std::make_unique<record>();
     fresh->factory = factory;
     fresh->order = std::move(node);
-    fresh->version = desc->version; // Exact published instance version; 0.0.0 is a legal value.
+    fresh->version = version; // Exact published instance version; 0.0.0 is a legal value.
     fresh->generation = next_generation++;
     fresh->state = phase::created;
+    fresh->config = std::move(config);
     fresh->ctx = std::make_unique<context>(*this, fresh.get());
     fresh->library = std::move(library);
 
@@ -935,6 +1486,12 @@ a::status engine::start_pending()
     std::vector<order_node> nodes;
     for (const auto& entry : records) {
         if (entry.second->state != phase::created) continue;
+        if (!entry.second->config) {
+            const std::string id = entry.first;
+            rollback_created(*this);
+            return fail(a::invalid_state, "plugin '" + id +
+                                              "' has no frozen configuration snapshot");
+        }
         pending.push_back(entry.first);
         nodes.push_back(entry.second->order);
     }
@@ -1305,6 +1862,140 @@ abi::v3::status host::add(abi::v3::iplug_fty* factory)
         // Native API boundary: an allocation failure must not escape as a C++ exception, and the
         // handler must not allocate a diagnostic either, so it reports the status alone.
         return abi::v3::failed;
+    }
+}
+
+abi::v3::status host::adopt(std::vector<plugin_activation> activations)
+{
+    if (!engine_) return abi::v3::failed;
+    if (!engine_->on_thread()) return abi::v3::wrong_thread;
+
+    struct prepared_activation {
+        std::size_t source = 0;
+        std::string id;
+        std::filesystem::path path;
+        order_node order;
+        abi::v3::plugin_version version{};
+        abi::v3::iplug_fty* factory = nullptr;
+        std::unique_ptr<plug> library;
+        std::unique_ptr<const detail::config_snapshot> config;
+    };
+
+    std::vector<prepared_activation> prepared;
+    std::size_t staged_count = 0;
+    const auto rollback_staged = [&]() noexcept {
+        while (staged_count != 0) {
+            --staged_count;
+            try {
+                detail::discard_record(*engine_, prepared[staged_count].id);
+            } catch (...) {
+                // Any record that cannot be discarded remains owned by the engine for shutdown.
+            }
+        }
+    };
+    try {
+        if (engine_->depth != 0) {
+            return detail::refuse(*engine_, abi::v3::busy,
+                                  "adopt cannot run while a plugin call is on the stack");
+        }
+        if (engine_->shutting_down) {
+            return engine_->fail(abi::v3::invalid_state,
+                                 "the host is shutting down and rejects discovered plugins");
+        }
+
+        std::set<std::string> identities;
+        std::set<std::filesystem::path> paths;
+        for (const auto& entry : engine_->records) {
+            identities.insert(entry.first);
+            if (entry.second->library && !entry.second->library->path().empty()) {
+                paths.insert(entry.second->library->path());
+            }
+        }
+
+        prepared.reserve(activations.size());
+        for (std::size_t index = 0; index < activations.size(); ++index) {
+            plugin_activation& activation = activations[index];
+            const plugin_description& description = activation.plugin.description();
+            abi::v3::iplug_fty* const factory = activation.plugin.factory();
+            const std::filesystem::path& path = activation.plugin.path();
+            if (factory == nullptr) {
+                return engine_->fail(abi::v3::invalid_argument,
+                                     "an activation has no live discovered factory");
+            }
+            if (description.plug_id.empty() || description.plug_id.size() > detail::max_string_bytes ||
+                description.plug_id.find('\0') != std::string::npos ||
+                !detail::valid_utf8(description.plug_id.data(), description.plug_id.size())) {
+                return engine_->fail(abi::v3::invalid_argument,
+                                     "an activation has an invalid discovered plugin identity");
+            }
+            if (path.empty() || !path.is_absolute()) {
+                return engine_->fail(abi::v3::invalid_argument,
+                                     "plugin '" + description.plug_id +
+                                         "' has no canonical discovered library path");
+            }
+            if (!identities.insert(description.plug_id).second) {
+                return engine_->fail(abi::v3::duplicate,
+                                     "plugin identity '" + description.plug_id +
+                                         "' conflicts with this activation batch or the host");
+            }
+            if (!paths.insert(path).second) {
+                return engine_->fail(abi::v3::duplicate,
+                                     "plugin library '" + path.string() +
+                                         "' conflicts with this activation batch or the host");
+            }
+
+            prepared_activation item;
+            item.source = index;
+            item.id = description.plug_id;
+            item.path = path;
+            item.order.plug_id = description.plug_id;
+            item.order.priority = description.priority;
+            item.order.before = description.before;
+            item.order.after = description.after;
+            item.version = description.version;
+            item.factory = factory;
+
+            std::string diagnostic;
+            const abi::v3::status frozen = detail::freeze_config(
+                item.id, activation.plugin.manifest(), activation.config, item.config, diagnostic);
+            if (frozen != abi::v3::ok) return engine_->fail(frozen, diagnostic);
+            prepared.push_back(std::move(item));
+        }
+
+        // Transfer every mapping only after the complete batch and every snapshot are valid. This
+        // stage still precedes the first create(), so a transfer inconsistency releases mappings
+        // through local RAII without leaving any runtime record behind.
+        for (prepared_activation& item : prepared) {
+            discovered_plugin& discovery = activations[item.source].plugin;
+            item.library = discovery.take_library();
+            if (!item.library || item.library->factory() != item.factory ||
+                item.library->path().native() != item.path.native()) {
+                return engine_->fail(abi::v3::invalid_state,
+                                     "discovery ownership changed before adopting plugin '" +
+                                         item.id + "'");
+            }
+        }
+
+        while (staged_count < prepared.size()) {
+            prepared_activation& item = prepared[staged_count];
+            const abi::v3::status staged = engine_->stage(
+                item.factory, std::move(item.order), item.version, std::move(item.library),
+                std::move(item.config));
+            if (staged != abi::v3::ok) {
+                std::string diagnostic = std::move(engine_->error);
+                rollback_staged();
+                engine_->error = std::move(diagnostic);
+                return staged;
+            }
+            ++staged_count;
+        }
+
+        engine_->error.clear();
+        return abi::v3::ok;
+    } catch (...) {
+        rollback_staged();
+        return detail::refuse(*engine_, abi::v3::failed,
+                              "the discovered activation batch failed unexpectedly");
     }
 }
 

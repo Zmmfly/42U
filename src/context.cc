@@ -44,6 +44,7 @@
 #include "internal.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -424,6 +425,11 @@ a::status U42_CALL context::query(const a::iid* type, void** out) noexcept
         if (!out) return a::invalid_argument;
         *out = nullptr;
         if (!type) return a::invalid_argument;
+        if (*type == cli::v1::config_iid) {
+            if (!owner) return a::unsupported;
+            *out = static_cast<cli::v1::iconfig*>(this);
+            return a::ok;
+        }
         if (*type == a::events_iid) {
             *out = static_cast<a::ievents*>(this);
             return a::ok;
@@ -445,6 +451,63 @@ a::status U42_CALL context::query(const a::iid* type, void** out) noexcept
         if (out) *out = nullptr;
         return a::failed;
     }
+}
+
+/**
+ * @brief Return all entries in the calling plugin's immutable configuration snapshot.
+ *
+ * @param[out] out Required borrowed array view, cleared before validation.
+ * @return ok on the control thread, unsupported for the administration context,
+ *         invalid_argument for a null output, wrong_thread off the control thread, or failed when
+ *         the owning record has no snapshot.
+ * @note The method performs no allocation and exposes only the context owner's prebuilt views.
+ */
+a::status U42_CALL context::entries(cli::v1::array_view<cli::v1::config_entry>* out) noexcept
+{
+    if (!out) return a::invalid_argument;
+    *out = {};
+    if (!runtime.on_thread()) return a::wrong_thread;
+    if (!owner) return a::unsupported;
+    if (!owner->config) return a::failed;
+
+    const std::vector<cli::v1::config_entry>& values = owner->config->entries;
+    out->data = values.empty() ? nullptr : values.data();
+    out->size = static_cast<std::uint64_t>(values.size());
+    return a::ok;
+}
+
+/**
+ * @brief Find one exact key in the calling plugin's immutable configuration snapshot.
+ *
+ * @param key Required non-empty bounded key view.
+ * @param[out] out Required borrowed entry, reset before validation and on failure.
+ * @return ok for a present key, not_found for an absent key, unsupported for the administration
+ *         context, invalid_argument for malformed arguments, wrong_thread off the control thread,
+ *         or failed when the owning record has no snapshot.
+ * @note Lookup compares the caller's bytes directly with owner-local strings and allocates no
+ *       temporary storage.
+ */
+a::status U42_CALL context::get(cli::v1::text_view key, cli::v1::config_entry* out) noexcept
+{
+    if (!out) return a::invalid_argument;
+    *out = {};
+    if (!runtime.on_thread()) return a::wrong_thread;
+    if (!owner) return a::unsupported;
+    if (!owner->config) return a::failed;
+    if (!cli::v1::valid_view(key) || key.size == 0 ||
+        key.size > cli::v1::max_identifier_bytes) {
+        return a::invalid_argument;
+    }
+
+    const config_snapshot& snapshot = *owner->config;
+    for (std::size_t index = 0; index < snapshot.values.size(); ++index) {
+        const std::string& candidate = snapshot.values[index].key;
+        if (candidate.size() != key.size) continue;
+        if (std::memcmp(candidate.data(), key.data, candidate.size()) != 0) continue;
+        *out = snapshot.entries[index];
+        return a::ok;
+    }
+    return a::not_found;
 }
 
 /**

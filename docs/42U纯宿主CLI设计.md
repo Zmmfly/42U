@@ -1,12 +1,12 @@
 # 42U 纯宿主 CLI 设计
 
-> 文档版本：0.1（设计草案）
+> 文档版本：1.0
 >
-> 状态：尚未实现。本文描述 ABI v3 之上的独立 CLI 扩展方向，不改变现行 `u42::abi::v3` 基础接口、项目版本或现有 `42uhost` 行为。
+> 状态：第一版已于 2026-09-24 实现。实现保留 `u42::abi::v3` 基础接口和项目版本 `0.3.0`，以独立 CLI manifest v1 与 `iconfig` 扩展提供纯宿主命令面。
 >
 > 范围：可信本地动态库插件的声明式 CLI 命令面、根级配置参数、发现流程、配置快照和命令执行边界。
 >
-> 审核：已完成一次独立架构审核；CLI11 相关结论基于对 CLI11 2.x 动态 option/subcommand 行为的检查。本文不声称已完成实现或测试。
+> 审核：实现期间完成多轮独立代码审核；CLI11 锁定为 `2.7.2`，GCC Debug、ASan 与 UBSan 的 15 个测试目标均通过。验证细节见 `docs/42U纯宿主CLI验证记录-2026-09-24.md`。
 
 ## 1. 定位
 
@@ -108,7 +108,7 @@ CLI manifest extension:
 CLI11 允许的语法多于 42U 协议应接受的语法。因此 CLI11 是实现工具，不是 42U CLI 语义的规范来源。前端必须显式限制：
 
 - 拒绝 `--serve.port=8080` 这类点号形式；
-- 拒绝 `++` 或 `--` 返回父级解析的形式；
+- 拒绝 `++` 返回父级解析；`--` 只允许出现在已选择命令后，作为“后续 token 全部属于当前命令剩余固定位置参数”的边界，不得返回父级或恢复根参数解析；
 - 拒绝选项前缀匹配；
 - 拒绝额外位置参数；
 - 保持 `require_subcommand(1, 1)`；
@@ -413,12 +413,18 @@ CLI11 版本应锁定，所有受限语法负例纳入持久测试。CLI11 升�
 
 ## 11. 实施顺序
 
-1. 冻结 manifest v1 数据结构、导出签名、长度限制和 `iconfig` IID；
-2. 实现独立 discovery 记录与 DSO 所有权移交；
-3. 实现配置快照和 `iconfig`；
-4. 引入 CLI11 并实现受限语法与动态命令面；
-5. 迁移或移除现有 `--list`、`--call`、`--call-id` 管理动作；
-6. 补齐发现、解析、配置、调用、退出码和兼容性测试；
-7. 常驻命令另立任务协议设计，不通过阻塞同步 handler 实现。
+1. 已冻结 manifest v1 数据结构、导出签名、长度限制和 `iconfig` IID；
+2. 已实现独立 discovery 记录与 DSO 所有权移交；
+3. 已实现配置快照和 `iconfig`；
+4. 已引入 CLI11 `2.7.2` 并实现受限语法与动态命令面；
+5. 已移除 `42uhost` 原有 `--list`、`--call`、`--call-id` 管理动作；
+6. 已补齐 manifest、发现、解析、配置、调用、输出和分配失败回滚测试；
+7. 常驻命令仍需另立任务协议设计，不通过阻塞同步 handler 实现。
 
-在上述项完成前，本文只是设计规范草案，不作为当前源码已支持该行为的验证依据。
+当前实现入口：
+
+- `inc/42u/cli.hpp`：manifest v1 与 `iconfig` ABI；
+- `inc/42u/plug.hpp`、`src/plug.cc`：不创建实例的 discovery 与 DSO 移交；
+- `inc/42u/host.hpp`、`src/host.cc`、`src/context.cc`：配置冻结、批量 adopt 和 owner-local `iconfig`；
+- `host/src/cli_catalog.cc`、`host/src/cli_frontend.cc`：manifest 深拷贝校验、受限 CLI11 与命令执行；
+- `tests/cli_*`、`tests/fixtures/cli_*`：ABI、parser、运行时与真实进程回归。

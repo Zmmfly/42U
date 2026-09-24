@@ -6,6 +6,7 @@
 - 语言标准：C++（当前构建配置为 C++17）
 - 项目版本：`0.3.0`（ABI v3）
 - 设计文档：[docs/42U插件框架设计.md](docs/42U插件框架设计.md)
+- 纯宿主 CLI：[docs/42U纯宿主CLI设计.md](docs/42U纯宿主CLI设计.md)
 - 迁移指南：[docs/42U-v3迁移指南.md](docs/42U-v3迁移指南.md)
 
 ## 仓库布局
@@ -13,12 +14,14 @@
 | 路径 | 内容 |
 | --- | --- |
 | `inc/42u/abi.hpp` | ABI v3 声明：状态码、框架服务接口 ID（`iid`）、插件版本（`plugin_version`/`version_range`）、跨界结构、宿主服务与生命周期纯虚接口、入口与布局断言；v1、v2 主版本被明确拒绝 |
-| `inc/42u/host.hpp` | 宿主公共门面 `u42::host`：`boot`/`start`/`load`/`unload`/`shutdown`/`poll`/`version`/`acquire`/`release`/`call`/`plugins`/`error` |
-| `inc/42u/plug.hpp` | 动态库映射 `u42::plug` 与确定性候选扫描 `u42::scan_plugins` |
+| `inc/42u/cli.hpp` | 独立版本化的 CLI manifest v1 与只读 `iconfig` 扩展 ABI；不包含 CLI11 类型 |
+| `inc/42u/host.hpp` | 宿主公共门面 `u42::host`：基础生命周期、调用网关，以及 discovery 批次的配置冻结与 `adopt()` |
+| `inc/42u/plug.hpp` | 动态库映射、确定性候选扫描，以及不创建实例的 `discovered_plugin` |
 | `inc/42u/order.hpp` | 初始化排序规划 `u42::plan_order`（优先级、`before`/`after`、环检测） |
 | `inc/42u/sdk.hpp` | 插件侧源级 RAII 辅助（非模板凭据租约：凭据 + 实际版本、字节视图、受限输出写入）；不进入 ABI，不保存任何提供者指针 |
 | `src/` | 宿主实现：生命周期引擎、上下文与服务实现、事件、库加载、排序 |
-| `host/src/main.cc` | 最小 CLI `42uhost`：启动一个插件目录，然后列出插件或调用一次 |
+| `host/include/42u/cli_host.hpp` | `42uhost` 私有前端的 owned catalog、解析结果和应用接口 |
+| `host/src/` | 纯宿主 CLI：manifest 校验、受限 CLI11 动态解析、配置与 handler 编排 |
 | `examples/` | 示例插件（`echo`、`consumer`），各自独立构建为 `.u42.so` |
 | `tests/` | 不依赖外部测试框架的检查 |
 | `docs/` | 设计文档与设计讨论稿 |
@@ -31,7 +34,8 @@ xmake f -m debug --toolchain=gcc --sanitizer=none -o build -y
 xmake -j 8 && xmake test -v
 ```
 
-首版不依赖第三方运行库或测试框架，仅使用 C++ 标准库和系统动态加载接口。可选运行时检查：
+核心静态库、插件 ABI 和测试夹具不依赖第三方运行库或测试框架。`42uhost_cli`
+单独使用锁定的 header-only CLI11 `2.7.2`。可选运行时检查：
 
 ```bash
 xmake f -m debug --sanitizer=address -o build/asan -y
@@ -51,32 +55,37 @@ xmake f -m debug --sanitizer=none -o build -y
 ## 运行 CLI
 
 ```bash
-# Linux 示例：按方法名调用 echo 示例插件的 echo 方法
-xmake run 42uhost --plugins build/linux/x86_64/debug/plugins --call com.example.echo echo '{"hello":"42u"}'
+# 插件目录优先来自 U42_PLUGIN_DIR；否则使用真实可执行文件旁的 plugins 目录。
+U42_PLUGIN_DIR=/opt/42u/plugins ./build/linux/x86_64/debug/42uhost \
+    --log-level debug serve --port 8080 node-a
 ```
 
 用法：
 
 ```text
-42uhost [--plugins DIR] (--list | --call PLUG METHOD JSON | --call-id PLUG NUMBER JSON)
-42uhost [--help]
+42uhost --version
+42uhost --help
+42uhost [plugin-declared-root-options] <command> [command-options] [positionals]
 ```
 
-| 选项 | 说明 |
+| 项目 | 说明 |
 | --- | --- |
-| `--plugins DIR` | 插件目录；省略时使用**可执行文件同级的 `plugins` 目录**（Linux 下经 `/proc/self/exe` 解析真实可执行文件路径） |
-| `--list` | 启动后逐行打印已就绪插件的标识；目录内没有候选插件时不输出内容并返回 0 |
-| `--call PLUG METHOD JSON` | 按方法名调用一次；`JSON` 传空字符串（`''`）表示无参数 |
-| `--call-id PLUG NUMBER JSON` | 按方法数字 ID 调用一次；`NUMBER` 为 `0..4294967295` 的十进制无符号整数 |
-| `--help`、`-h` | 打印用法并返回 0；完全不带参数运行也同样打印用法并返回 0 |
+| `--version` | 宿主保留项；不扫描、不映射插件，打印项目版本 |
+| `--help` | 宿主保留项；读取插件 manifest 生成完整帮助，但不 `create/init/start` |
+| 根参数 | 由插件声明，必须出现在子命令之前，只进入所属插件的配置快照 |
+| 子命令与局部参数 | 由插件声明；局部参数必须出现在所属子命令之后 |
+| `command -- <positionals>` | `--` 仅把后续 token 作为当前命令剩余的位置参数，不返回父级，也不再解析选项 |
+| 插件目录 | `U42_PLUGIN_DIR` 指定一个目录；未设置时使用真实可执行文件同级的 `plugins` |
 
 约定：
 
-- **先校验、后加载**：未知选项、重复或冲突的动作、参数不足、带符号或非十进制、溢出的数字，都在参数解析阶段拒绝；只有命令行通过校验后才会加载插件动态库。
-- **不解析 JSON**：`JSON` 参数按原始字节转发给插件；调用成功后插件返回的 JSON 原样写到 stdout（仅在其不以换行结尾时补一个换行），本工具不做校验、重排或包装。CLI 语法不变，但每次调用前都先用 `host::version()` **显式发现一次提供者当前版本**，再把 `exact_version(actual)` 传给一次性调用；这是管理端对单次操作给出的版本要求，不代表普通消费者会自动接受未知版本，也不宣称能校验 JSON/schema。
-- **失败语义**：错误以 `error: <stage>: <status>: <host 诊断>` 形式写到 stderr（例如 `boot` 目录不存在）；退出码 `2` 表示命令行被拒绝，`1` 表示 `boot`、调用或 `shutdown` 失败，`0` 表示成功。
-- **显式 shutdown**：每次成功 `boot` 之后都会调用 `shutdown()`，`shutdown` 失败同样以非零退出；宿主析构只作为兜底，不是正常清理路径。
-- **单动作、非交互**：一次进程只执行 `--list` 或一次调用，不做交互式会话。动态卸载/重载通过 C++ 的 `host::unload()` 与 `host::load()` 使用，CLI 暂无 `--reload` 选项。
+- **先发现、后解析、再创建**：完整帮助需要映射可信插件并读取 manifest；manifest 冲突和 argv 错误都在任何实例创建前失败。
+- **插件拥有业务命令面**：宿主只保留 `--help`/`--version`。根参数、一级子命令、局部参数和 handler `method_id` 均由插件声明。
+- **配置隔离**：根参数和显式 `config_key` 映射只进入所属插件的只读快照；`iconfig` 没有跨插件查询入口。
+- **确定性 payload**：局部参数默认按稳定 `parameter_id` 序列化为 JSON；TEXT 为字符串、repeatable 为数组、FLAG 为 boolean。插件返回结果按原始字节写到 stdout，不补换行、不重排。
+- **受限语法**：不支持 short option、前缀匹配、点号子命令寻址、`++` 返回父级、额外位置参数或多命令执行。
+- **退出码**：`0` 成功，`1` 发现/声明/启动/执行/清理或输出失败，`2` 用户输入错误。业务成功但 shutdown 失败仍返回 `1`。
+- **同步短命令**：一次进程最多执行一个有限时长 handler；常驻任务、流式输出和取消协议尚未实现。
 
 ## ABI 与运行模型
 
@@ -84,7 +93,7 @@ xmake run 42uhost --plugins build/linux/x86_64/debug/plugins --call com.example.
 
 ABI v3 采用 **C 链接入口 + 受约束的 C++ 纯虚接口**，并把插件间协作收敛为 **invoke-only**：
 
-- 动态库只导出一个入口 `u42_get_factory`：先协商基础 ABI 主版本（当前为 `3`），再返回库内工厂。只支持主版本 `1` 或 `2` 的旧库对宿主的版本 `3` 请求返回 `unsupported`，并被明确拒绝加载；v3 不提供 v1/v2 的源兼容别名或同 IID 变签名，旧插件必须先迁移源码再重新编译。
+- 动态库的基础 ABI 必需入口是 `u42_get_factory`：先协商基础 ABI 主版本（当前为 `3`），再返回库内工厂；需要贡献 CLI 命令面的插件可额外导出独立协商的 `u42_get_cli_manifest`。只支持主版本 `1` 或 `2` 的旧库对宿主的版本 `3` 请求返回 `unsupported`，并被明确拒绝加载；v3 不提供 v1/v2 的源兼容别名或同 IID 变签名，旧插件必须先迁移源码再重新编译。
 - 跨界类型限定为固定宽度整数、已定义布局的简单结构（含插件版本 `plugin_version{ major, minor, patch }` 与版本范围 `version_range{ minimum, maximum }`）、不透明标识（`token`）、指针与长度视图（`bytes`）、宿主服务与生命周期纯虚接口指针。STL 容器、异常、RTTI 对象、线程对象不跨边界；边界函数为 `noexcept`，异常在产生侧转换为状态码。
 - 对象由分配方销毁：宿主调用插件的 `destroy()`，消费者不销毁任何提供者对象（它只持有宿主签发的凭据和按值复制的实际版本）；跨库 `new`/`delete` 不成立。
 - 宿主服务接口只有纯虚函数、无数据成员，指针只能通过 `ictx::query` 取得，不能由根对象地址推算。插件之间**不共享业务类、接口指针或提供者 `iinvoke` 指针**：唯一业务路径是 `消费者 → 宿主 icalls → 提供者 iinvoke`，且每次调用都要出示借用凭据；`iplug::query` 是宿主私有管理入口，宿主只用它取得 `invoke_iid`。
@@ -105,6 +114,8 @@ ABI v3 采用 **C 链接入口 + 受约束的 C++ 纯虚接口**，并把插件�
 | `invoke_iid` | 5 | `iinvoke` | 插件提供的动态方法入口，仅宿主经 `iplug::query` 取得 |
 
 插件通过注入的 `ictx::query(&iid, &out)` 取得前四项宿主服务；`invoke_iid` 对应插件提供的入口，由宿主通过 `iplug::query` 获取，不能向 `ictx` 查询，也不向其他插件暴露。根实例接口为 `iplug`（`init`/`start`/`stop`/`destroy` 与 `iplug::query`），工厂为 `iplug_fty`（`describe`/`create`），库内元数据为 `plug_desc`（含 `plugin_version version`），方法描述为 `method_desc`。
+
+CLI manifest v1 另行定义 `config_iid` 和 `iconfig`，不修改上表 ABI v3 的既有 IID 或虚表。插件可选导出 `u42_get_cli_manifest`；未导出的旧 v3 插件继续加载，只是不贡献命令面。
 
 版本与范围约定：
 
@@ -129,6 +140,8 @@ ABI v3 采用 **C 链接入口 + 受约束的 C++ 纯虚接口**，并把插件�
 当前（ABI v3）：
 
 - [docs/42U插件框架设计.md](docs/42U插件框架设计.md)：设计主文档（目标与范围、启动流程、初始化编排、按版本借用与凭据直接调用、动态卸载、ABI v3 交付约束、验收标准）。
+- [docs/42U纯宿主CLI设计.md](docs/42U纯宿主CLI设计.md)：插件声明根参数、一级子命令、配置快照、发现移交与受限 CLI11 语法。
+- [docs/42U纯宿主CLI验证记录-2026-09-24.md](docs/42U纯宿主CLI验证记录-2026-09-24.md)：纯宿主 CLI 的构建、测试、sanitizer 和审核修复记录。
 - [docs/42U-v3迁移指南.md](docs/42U-v3迁移指南.md)：从 ABI v2 迁移到 v3 的旧/新对照、三步借用与调用示例及检查清单。
 - [docs/42U-v3验证记录-2026-09-19.md](docs/42U-v3验证记录-2026-09-19.md)：本轮完整验证、独立审查、源码指纹和限制。
 
@@ -164,3 +177,9 @@ GCC Debug、GCC ASan（开启正常退出泄漏检测）、GCC UBSan、Clang Rel
 当前包含 307 项重入检查、16 个 lease/version 专项场景、21 个 SDK cases、14 个 ABI cases；原有运行时 22 cases 等价保留。借用返回实际版本、闭区间边界、同版本重载后旧凭据失效、主动/撤销归还和在途 busy 均有持久回归。boot 测试的 5 个一次性调用分配失败点均恢复且无多余租约。
 
 命令、证据与源码指纹见[本轮 v3 验证记录](docs/42U-v3验证记录-2026-09-19.md)。开发配置已恢复为 GCC Debug、无 sanitizer、输出到 `build/`；不支持 v1/v2 插件与 v3 宿主混用。
+
+### 纯宿主 CLI 验证状态（2026-09-24）
+
+GCC Debug、GCC ASan（`detect_leaks=0`）与 GCC UBSan 均为 **15/15 测试目标通过**。新增持久测试覆盖 manifest ABI、动态 parser 负例、显式空值、配置隔离、原样输出、输出设备失败、帮助/解析错误不创建实例、真实 DSO 生命周期、配置 defensive validation，以及 create 成功后的分配失败整批回滚。
+
+详细命令、审核修复和仍未纳入第一版的边界见[纯宿主 CLI 验证记录（2026-09-24）](docs/42U纯宿主CLI验证记录-2026-09-24.md)。
