@@ -1,0 +1,1 @@
+This directory intentionally holds no *.plug.ts module; boot() over it must succeed.

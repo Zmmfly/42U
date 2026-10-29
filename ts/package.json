@@ -1,0 +1,17 @@
+{
+  "name": "u42-rack-ts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript rewrite of the 42U plugin rack: host-orchestrated, invoke-only, version-leased, hot-pluggable plugins.",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "demo": "node apps/demo.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

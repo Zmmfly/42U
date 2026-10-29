@@ -1,0 +1,2 @@
+This directory merely looks like a plugin file (`zdir.plug.ts`); discovery considers regular
+files only and must ignore it.
